@@ -33,12 +33,16 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 - More deformers.
 - Displace from an image, a gentler smoothing mode, a wave that fades with distance, a Shrinkwrap offset.
 
-## Volumes (`volume.py`) — in progress, pull request "Volume Builder and Volume Mesher"
-- **Volume Builder**: its children (meshes, splines, points, other Volume Builders) become one volume, each child added,
-  subtracted or intersected in list order, with a voxel size and smoothing filters per child; output as a distance or
-  a density volume.
-- **Volume Mesher**: turns the Volume Builder under it back into a mesh, with threshold, adaptivity and smoothing.
-- Both on Blender's own volume grid nodes, settings on the object, so files work with the add-on off.
+## Volumes (`volume.py`)
+In: the **Volume Builder** (meshes, splines, points and other Volume Builders under it become one distance volume; an
+Objects list adds, subtracts or intersects each one in order, with Radius, Grow / Shrink and Smoothing per row and
+Voxel Size, Grow / Shrink, Smoothing and Rounding for the whole) and the **Volume Mesher** (turns the Volume Builder
+under it into a surface: Threshold, Adaptivity, Smoothing, Smooth Shading; the surface takes the Mesher's material).
+Still to do:
+- A fog (density) output for rendering a Volume Builder as smoke or clouds, with a ready volume material.
+- More filters per row, in a stack (dilate and erode, median, curvature), and a smooth blend between rows.
+- Text objects and particles as inputs; a Volume Builder that reads a Cloner's copies.
+- Drag and drop into the Objects list from the Object Manager.
 
 ## Lights and sky (`lights.py`, `sky.py`)
 - Volumetric glow per light.
