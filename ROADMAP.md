@@ -36,8 +36,9 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 ## Volumes (`volume.py`)
 In: the **Volume Builder** (meshes, splines, text, points and other Volume Builders under it become one distance
 volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
-order, with Radius, Grow / Shrink and a Filter (Smooth, Clean, Relax, Round) per row and Voxel Size, Grow / Shrink,
-Smoothing and Rounding for the whole; Render as Fog renders it as fog or smoke with its own density and colour) and
+order, with Volume From (Auto, Filled, Surface, Points, Edges), Radius, Grow / Shrink and a Filter (Smooth, Clean,
+Relax, Round) per row and Voxel Size, Grow / Shrink,
+Smoothing and Rounding for the whole; the viewport shows it as a surface, voxels or fog; Render as Fog renders it as fog or smoke with its own density and colour) and
 the **Volume Mesher** (turns the Volume Builder under it into a surface: Threshold, Adaptivity, Smoothing, Smooth
 Shading; the surface takes the Mesher's material).
 Still to do:

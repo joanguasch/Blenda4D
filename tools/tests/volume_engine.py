@@ -289,7 +289,60 @@ def test_switch_off():
     V.register()
 
 
-for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_switch_off):
+def test_volume_from_and_viewport():
+    print("== Volume From on each row, and how the builder looks in the viewport")
+    clear()
+    from blenda4d import primitives as P
+    plat = P.add_primitive(bpy.context, "platonic")
+    update()
+    check(len(plat.data.polygons) == 0, "a Platonic's own mesh is empty (its faces come from its modifier)")
+    vb = add("volume_builder", [plat])
+    row = vb.b4d_vol_items[0]
+    check(V._input_shape(plat, row) == "solid", "Auto fills a Platonic instead of taking its points")
+    vm = add("volume_mesher", [vb])
+    filled = surface(vm)
+    check(filled[1] > 200 and min(filled[2]) > 1.5, f"the Platonic is a whole volume ({filled[2]})")
+    for src, shape in (("POINTS", "points"), ("EDGES", "tube"), ("SURFACE", "text"), ("FILLED", "solid")):
+        row.source = src
+        update()
+        check(V._input_shape(plat, row) == shape, f"Volume From {src} reads it as {shape}")
+        s = surface(vm)
+        if src == "FILLED":
+            check(s[1] == filled[1], "back to Filled it is the same volume again")
+        else:
+            check(s[1] > 0 and s != filled, f"Volume From {src} makes a different volume ({s[1]} faces)")
+    row.source = "POINTS"
+    small = surface(vm)
+    row_change(vb, row, "radius", 30.0, "Radius (Volume From Points)", vm)
+    row.source = "FILLED"
+    vm.select_set(False)
+    vb.parent, vm.parent = None, None
+    bpy.data.objects.remove(vm)
+    update()
+    me = bpy.data.meshes.new("Edges")
+    me.from_pydata([(0, 0, 0), (1, 0, 0), (1, 1, 0)], [(0, 1), (1, 2)], [])
+    wire = bpy.data.objects.new("Edges", me)
+    bpy.context.collection.objects.link(wire)
+    check(V._auto_shape(wire) == "tube", "a mesh with only edges becomes tubes")
+    bpy.data.objects.remove(wire)
+    # viewport: a surface by default, voxels, or the old fog; only drawn in the viewport, never rendered
+    check(vb.b4d_vol_view == "SURFACE", "the builder shows its surface by default")
+    nodes = [n.bl_idname for n in V.mod_of(vb).node_group.nodes]
+    check("GeometryNodeIsViewport" in nodes and "GeometryNodeGridToMesh" in nodes, "a surface made only for the viewport")
+    s = surface(vb)
+    check(s[1] > 200, f"the builder itself shows a solid surface ({s[1]} faces)")
+    check(V.GRID in grids(vb), "and still carries its distance grid")
+    check(grids(vb)[0] == "density", "the grid the viewport draws comes first (not the distance grid as a haze)")
+    vb.b4d_vol_view = "VOXELS"
+    v = surface(vb)
+    check(v[1] > 0 and v[1] % 6 == 0, f"Voxels shows cubes ({v[1] // 6})")
+    vb.b4d_vol_view = "FOG"
+    check(surface(vb)[1] == 0 and grids(vb)[0] == "density", "Fog shows only the fog, drawn from its density grid")
+    vb.b4d_vol_view = "SURFACE"
+    update()
+
+
+for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_switch_off):
     try:
         t()
     except Exception:

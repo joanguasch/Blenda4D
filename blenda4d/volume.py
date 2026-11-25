@@ -105,18 +105,42 @@ def builder_of(mesher):
     return next((c for c in g.kids_of(mesher) if kind(c) == "volume_builder"), None)
 
 
-def _input_shape(ob):
-    """How an object is turned into a volume: 'builder', 'solid' (faces), 'points' or 'tube'."""
-    if kind(ob) == "volume_builder":
-        return "builder"
+SOURCES = [
+    ("AUTO", "Auto", "Pick from the object: closed meshes are filled, splines become tubes, flat text a shell, loose points balls"),
+    ("FILLED", "Filled", "The whole inside of a closed mesh (needs a mesh without holes)"),
+    ("SURFACE", "Surface", "A shell of Radius over the faces: for open, flat or single-sided shapes"),
+    ("POINTS", "Points", "A ball of Radius on every point"),
+    ("EDGES", "Edges", "A tube of Radius along every edge or spline"),
+]
+SHAPE = {"FILLED": "solid", "SURFACE": "text", "POINTS": "points", "EDGES": "tube"}
+
+
+def _auto_shape(ob):
     if ob.type == "CURVE":
         return "tube"
-    if ob.type == "FONT":                             # flat letters have no inside: they become rounded letters
+    if ob.type == "FONT":                             # flat letters have no inside: they become a shell
         cu = ob.data
         return "solid" if (cu.extrude > 0 or cu.bevel_depth > 0) else "text"
-    if ob.type == "POINTCLOUD" or (ob.type == "MESH" and len(ob.data.polygons) == 0):
+    if ob.type == "POINTCLOUD":
         return "points"
+    if ob.type == "MESH" and len(ob.data.polygons) == 0:
+        if any(m.show_viewport for m in ob.modifiers):  # made by a modifier (a Platonic, a Cube...): its faces come later
+            return "solid"
+        return "tube" if len(ob.data.edges) else "points"
     return "solid"
+
+
+def _input_shape(ob, row=None):
+    """How an object is turned into a volume: 'builder', 'solid' (filled), 'text' (shell over the faces),
+    'points' (balls) or 'tube' (along edges and splines)."""
+    if kind(ob) == "volume_builder":
+        return "builder"
+    src = getattr(row, "source", "AUTO") if row is not None else "AUTO"
+    if src == "AUTO":
+        return _auto_shape(ob)
+    if src == "FILLED" and ob.type == "CURVE":       # a spline has no inside of its own: fill it flat and shell it
+        return "text"
+    return SHAPE[src]
 
 
 # --- node groups -----------------------------------------------------------------------------------------------
@@ -188,7 +212,7 @@ def _new_tree(name, k, owner):
 def _row_grid(G, builder, i, row, voxel):
     """The distance grid of one row, with its Grow / Shrink and Smoothing."""
     ob = row.obj
-    shape = _input_shape(ob)
+    shape = _input_shape(ob, row)
     geo = G.info(ob).outputs["Geometry"]
     if shape == "builder":
         get = G.node("GeometryNodeGetNamedGrid", data_type="FLOAT")
@@ -204,16 +228,26 @@ def _row_grid(G, builder, i, row, voxel):
             circle = G.node("GeometryNodeCurvePrimitiveCircle", mode="RADIUS")
             circle.inputs["Resolution"].default_value = 12
             G.l.new(radius, circle.inputs["Radius"])
+            edges = G.node("GeometryNodeMeshToCurve")    # a mesh's edges become splines; splines pass through
+            G.l.new(geo, edges.inputs["Mesh"])
+            both = G.node("GeometryNodeJoinGeometry")
+            G.l.new(geo, both.inputs[0])
+            G.l.new(edges.outputs[0], both.inputs[0])
             tube = G.node("GeometryNodeCurveToMesh")
-            G.l.new(geo, tube.inputs["Curve"])
+            G.l.new(both.outputs[0], tube.inputs["Curve"])
             G.l.new(circle.outputs["Curve"], tube.inputs["Profile Curve"])
             tube.inputs["Fill Caps"].default_value = True
             sdf = G.node("GeometryNodeMeshToSDFGrid")
             G.l.new(tube.outputs["Mesh"], sdf.inputs["Mesh"])
             G.l.new(voxel, sdf.inputs["Voxel Size"])
         elif shape == "text":                         # points spread over the letters, each a ball of Radius
+            fill = G.node("GeometryNodeFillCurve")       # splines are filled flat first
+            G.l.new(geo, fill.inputs["Curve"])
+            both = G.node("GeometryNodeJoinGeometry")
+            G.l.new(geo, both.inputs[0])
+            G.l.new(fill.outputs[0], both.inputs[0])
             spread = G.node("GeometryNodeDistributePointsOnFaces", distribute_method="RANDOM")
-            G.l.new(geo, spread.inputs["Mesh"])
+            G.l.new(both.outputs[0], spread.inputs["Mesh"])
             G.l.new(G.m("DIVIDE", 4.0, G.m("MULTIPLY", voxel, voxel)), spread.inputs["Density"])
             sdf = G.node("GeometryNodePointsToSDFGrid")
             G.l.new(spread.outputs["Points"], sdf.inputs["Points"])
@@ -222,8 +256,11 @@ def _row_grid(G, builder, i, row, voxel):
         elif shape == "points":
             pts = G.node("GeometryNodeMeshToPoints")
             G.l.new(geo, pts.inputs["Mesh"])
+            cpts = G.node("GeometryNodeCurveToPoints", mode="EVALUATED")
+            G.l.new(geo, cpts.inputs["Curve"])
             join = G.node("GeometryNodeJoinGeometry")    # a point cloud object passes straight through
             G.l.new(pts.outputs[0], join.inputs[0])
+            G.l.new(cpts.outputs["Points"], join.inputs[0])
             G.l.new(geo, join.inputs[0])
             sdf = G.node("GeometryNodePointsToSDFGrid")
             G.l.new(join.outputs[0], sdf.inputs["Points"])
@@ -347,12 +384,69 @@ def build_builder(builder):
         setm.inputs["Material"].default_value = fog_material()
         G.l.new(setm.outputs[0], gout.inputs[0])
         return tree
+    if builder.b4d_vol_view == "FOG":
+        shown = G.node("GeometryNodeStoreNamedGrid", data_type="FLOAT")
+        shown.inputs["Name"].default_value = "density"
+        _first(G, shown, store)
+        G.l.new(fog.outputs[0], shown.inputs["Grid"])
+        G.l.new(store.outputs[0], gout.inputs[0])
+        return tree
+    # Surface or Voxels: the viewport draws a mesh of the volume. The volume keeps an empty "density" grid (the one
+    # Blender draws), so the distance grid doesn't show as a haze; the mesh is only made in the viewport
+    blank = G.node("GeometryNodeFieldToGrid", data_type="FLOAT")
+    bitem = blank.grid_items.new("FLOAT", "Density")
+    G.l.new(fillet.outputs[0], blank.inputs["Topology"])
+    (blank.inputs[bitem.name] if bitem.name in blank.inputs else blank.inputs[1]).default_value = 0.0
     shown = G.node("GeometryNodeStoreNamedGrid", data_type="FLOAT")
     shown.inputs["Name"].default_value = "density"
-    G.l.new(store.outputs[0], shown.inputs["Volume"])
-    G.l.new(fog.outputs[0], shown.inputs["Grid"])
-    G.l.new(shown.outputs[0], gout.inputs[0])
+    _first(G, shown, store)
+    G.l.new(blank.outputs[0], shown.inputs["Grid"])
+    if builder.b4d_vol_view == "VOXELS":             # a cube on every voxel at the surface, like building blocks
+        cells = G.node("GeometryNodeGridToPoints", data_type="FLOAT")
+        G.l.new(fillet.outputs[0], cells.inputs["Grid"])
+        near = G.node("FunctionNodeCompare", data_type="FLOAT", operation="LESS_EQUAL")
+        G.l.new(cells.outputs["Value"], near.inputs[0])
+        near.inputs[1].default_value = 0.0
+        far = G.node("FunctionNodeCompare", data_type="FLOAT", operation="GREATER_THAN")
+        G.l.new(cells.outputs["Value"], far.inputs[0])
+        G.l.new(G.m("MULTIPLY", voxel, -1.0), far.inputs[1])
+        both = G.node("FunctionNodeBooleanMath", operation="AND")
+        G.l.new(near.outputs[0], both.inputs[0])
+        G.l.new(far.outputs[0], both.inputs[1])
+        keep = G.node("GeometryNodeSeparateGeometry", domain="POINT")
+        G.l.new(cells.outputs["Points"], keep.inputs["Geometry"])
+        G.l.new(both.outputs[0], keep.inputs["Selection"])
+        box = G.node("GeometryNodeMeshCube")
+        size = G.node("ShaderNodeCombineXYZ")
+        v95 = G.m("MULTIPLY", voxel, 0.95)
+        for k in range(3):
+            G.l.new(v95, size.inputs[k])
+        G.l.new(size.outputs[0], box.inputs["Size"])
+        inst = G.node("GeometryNodeInstanceOnPoints")
+        G.l.new(keep.outputs["Selection"], inst.inputs["Points"])
+        G.l.new(box.outputs["Mesh"], inst.inputs["Instance"])
+        look = G.node("GeometryNodeRealizeInstances")
+        G.l.new(inst.outputs[0], look.inputs["Geometry"])
+        look = look.outputs[0]
+    else:
+        surf = G.node("GeometryNodeGridToMesh")
+        G.l.new(fillet.outputs[0], surf.inputs["Grid"])
+        look = surf.outputs["Mesh"]
+    gate = G.node("GeometryNodeSwitch", input_type="GEOMETRY")     # the mesh is only a preview: none in renders
+    G.l.new(G.node("GeometryNodeIsViewport").outputs[0], gate.inputs["Switch"])
+    G.l.new(look, gate.inputs["True"])
+    join = G.node("GeometryNodeJoinGeometry")
+    G.l.new(gate.outputs[0], join.inputs[0])
+    G.l.new(store.outputs[0], join.inputs[0])
+    G.l.new(join.outputs[0], gout.inputs[0])
     return tree
+
+
+def _first(G, shown, store):
+    """Put the "density" grid (shown) into the volume before the distance grid (store): the viewport draws a volume's
+    first grid, and the distance grid drawn as fog is only a grey haze."""
+    G.l.new(G.node("GeometryNodeJoinGeometry").outputs[0], shown.inputs["Volume"])
+    G.l.new(shown.outputs[0], store.inputs["Volume"])
 
 
 def build_mesher(mesher):
@@ -397,8 +491,8 @@ def _material(ob):
 
 def _signature(ob):
     if kind(ob) == "volume_builder":
-        return ([f"{r.obj.name}:{r.mode}:{_input_shape(r.obj)}:{r.filter}" for r in rows(ob)] +
-                [str(len(ob.b4d_vol_items)), f"fog:{ob.b4d_vol_fog}"])
+        return ([f"{r.obj.name}:{r.mode}:{_input_shape(r.obj, r)}:{r.filter}" for r in rows(ob)] +
+                [str(len(ob.b4d_vol_items)), f"fog:{ob.b4d_vol_fog}", f"view:{ob.b4d_vol_view}"])
     src = builder_of(ob)
     return [src.name if src else "", getattr(_material(ob), "name", "")]
 
@@ -604,8 +698,10 @@ class BLENDA4D_PG_volume_item(bpy.types.PropertyGroup):
                                 description="Leave this object out for a while without taking it out from under the Volume Builder")
     mode: bpy.props.EnumProperty(name="Mode", items=MODES, default="ADD", update=_row_changed,
                                  description="How this object meets the volume made by the rows above it")
+    source: bpy.props.EnumProperty(name="Volume From", items=SOURCES, default="AUTO", update=_row_changed,
+                                   description="What part of the object becomes volume")
     radius: bpy.props.FloatProperty(name="Radius", default=10.0, min=0.0, soft_max=1000.0, precision=1,
-                                    description="Splines become tubes and points become balls this thick (cm)")
+                                    description="How thick the tubes, balls or shell are (cm)")
     grow: bpy.props.FloatProperty(name="Grow / Shrink", default=0.0, soft_min=-100.0, soft_max=100.0, precision=1,
                                   description="Make this object's part thicker (positive) or thinner (cm)")
     smooth: bpy.props.IntProperty(name="Smoothing", default=0, min=0, max=50,
@@ -664,6 +760,8 @@ def page_builder(col, ob):
         s = slot(ob, sname)
         if s is not None:
             col.prop(*s, text=sname + (" (cm)" if sname in ("Voxel Size", "Grow / Shrink") else ""))
+    if not ob.b4d_vol_fog:
+        col.prop(ob, "b4d_vol_view")
     col.prop(ob, "b4d_vol_fog")
     if ob.b4d_vol_fog:
         sub = col.column()
@@ -697,12 +795,15 @@ def page_builder(col, ob):
         box.prop(row, "mode")
         if i == 0:
             box.label(text="The first row starts the volume", icon="INFO")
-        if _input_shape(row.obj) in ("tube", "points", "text"):
+        if kind(row.obj) != "volume_builder":
+            box.prop(row, "source")
+        shape = _input_shape(row.obj, row)
+        if shape in ("tube", "points", "text"):
             box.prop(row, "radius", text="Radius (cm)")
         box.prop(row, "grow", text="Grow / Shrink (cm)")
         box.prop(row, "filter")
         box.prop(row, "smooth", text="Passes")
-        if _input_shape(row.obj) == "solid" and not _closed(row.obj):
+        if shape == "solid" and row.obj.type == "MESH" and len(row.obj.data.polygons) and not _closed(row.obj):
             box.label(text="This mesh has holes: its inside may come out wrong", icon="ERROR")
 
 
@@ -772,6 +873,12 @@ def register():
     bpy.types.Object.b4d_vol_fog = bpy.props.BoolProperty(
         name="Render as Fog", default=False, update=_fog_changed,
         description="Render the volume as fog or smoke (a volume material reads it), not only feed a Volume Mesher")
+    bpy.types.Object.b4d_vol_view = bpy.props.EnumProperty(
+        name="Viewport", default="SURFACE", update=_row_changed,
+        items=[("SURFACE", "Surface", "Show the volume's surface as a solid shape"),
+               ("VOXELS", "Voxels", "Show the volume as a cube on every voxel at its surface"),
+               ("FOG", "Fog", "Show the volume as a soft fog")],
+        description="How the Volume Builder looks in the viewport (renders are not affected)")
     from . import managers
     if drop not in managers.OM_DROP:
         managers.OM_DROP.append(drop)
@@ -791,7 +898,7 @@ def unregister():
     from . import managers
     if drop in managers.OM_DROP:
         managers.OM_DROP.remove(drop)
-    for n in ("b4d_vol_items", "b4d_vol_index", "b4d_vol_fog"):
+    for n in ("b4d_vol_items", "b4d_vol_index", "b4d_vol_fog", "b4d_vol_view"):
         if hasattr(bpy.types.Object, n):
             delattr(bpy.types.Object, n)
     for c in reversed(classes):

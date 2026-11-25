@@ -134,6 +134,11 @@ def scene():
     lm.data.materials.append(material("Mint", (0.3, 0.8, 0.6, 1)))
     bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, location=(0.0, -1.5, -0.6))
     bpy.context.object.name = "Pebble"
+    from blenda4d import primitives as P
+    gem = P.add_primitive(bpy.context, "platonic")    # its faces come from its modifier: Auto must still fill it
+    gem.location = (4.5, 3.5, 0.0)
+    gv = add("volume_builder", [gem])
+    gv.name = "Gem Volume"
     blenda4d.volume.sync_all()
     log("SCENE", [o.name for o in bpy.data.objects])
 
@@ -250,6 +255,24 @@ PLAN += [lambda: set_mode("Volume Builder", 1, "INTERSECT")] + W * 3 + [lambda: 
 PLAN += [lambda: set_mode("Volume Builder", 1, "SUBTRACT")] + W * 2
 PLAN += [lambda: set_filter("Volume Builder", 0, "CURVATURE")] + W * 3 + [lambda: select("Volume Builder", 0)] + W * 2
 PLAN += [lambda: shot("builder_box_row_round_filter")]
+def gem(attr, v):
+    ob = bpy.data.objects["Gem Volume"]
+    if attr == "view":
+        ob.b4d_vol_view = v
+    else:
+        setattr(ob.b4d_vol_items[0], attr, v)
+    ev = ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    log("GEM", attr, v, "faces", len(ev.data.polygons) if ev.data else -1)
+
+
+PLAN += [lambda: select("Gem Volume", 0)] + W * 3 + [lambda: shot("gem_surface_material")]
+PLAN += [lambda: shading("SOLID")] + W * 3 + [lambda: shot("gem_surface_solid")]
+PLAN += [lambda: gem("view", "VOXELS")] + W * 3 + [lambda: shot("gem_voxels")]
+PLAN += [lambda: gem("view", "FOG")] + W * 3 + [lambda: shot("gem_fog_view")]
+PLAN += [lambda: gem("view", "SURFACE"), lambda: gem("source", "POINTS")] + W * 3 + [lambda: shot("gem_from_points")]
+PLAN += [lambda: gem("source", "EDGES")] + W * 3 + [lambda: shot("gem_from_edges")]
+PLAN += [lambda: gem("source", "SURFACE")] + W * 3 + [lambda: shot("gem_from_surface")]
+PLAN += [lambda: gem("source", "AUTO"), lambda: shading("MATERIAL")] + W * 3
 PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume_fog")]
 PLAN += [lambda: select("Letters", 0)] + W * 3 + [lambda: shot("letters_builder")]
 PLAN += drag_steps("Pebble", "Volume Builder") + W * 3 + [lambda: shot("drop_pebble_into_builder")]
