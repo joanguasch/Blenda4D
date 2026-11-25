@@ -274,6 +274,9 @@ def _feed_object(src):
     return ob
 
 
+ALIVE_VALUE = bpy.types.Particle.bl_rna.properties["alive_state"].enum_items["ALIVE"].value
+
+
 def _particle_points(src, depsgraph):
     import numpy as np
     ev = src.evaluated_get(depsgraph)
@@ -286,13 +289,11 @@ def _particle_points(src, depsgraph):
             continue
         co = np.empty(n * 3, dtype=np.float32)
         ps.particles.foreach_get("location", co)
-        alive = np.empty(n, dtype=np.int32) if hasattr(ps.particles[0], "alive_state") else None
         sz = np.empty(n, dtype=np.float32)
         ps.particles.foreach_get("size", sz)
-        keep = np.ones(n, dtype=bool)
-        if alive is not None:
-            states = [p.alive_state for p in ps.particles]
-            keep = np.array([st == "ALIVE" for st in states], dtype=bool)
+        state = np.empty(n, dtype=np.int32)           # read in one go: foreach_get gives each state's enum value
+        ps.particles.foreach_get("alive_state", state)
+        keep = state == ALIVE_VALUE
         cos.append(co.reshape(-1, 3)[keep])
         sizes.append(sz[keep])
     if not cos:

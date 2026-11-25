@@ -315,6 +315,14 @@ PLAN += [lambda: select("Layered Volume", 2)] + W * 3 + [lambda: shot("layer_smo
 PLAN += [lambda: layered("move")] + W * 4 + [lambda: layered("moved"), lambda: shot("layer_field_moved")]
 PLAN += [lambda: layered("fine")] + W * 6 + [lambda: layered("fine done"), lambda: shot("layer_voxel_2cm")]
 PLAN += [lambda: shading("MATERIAL"), lambda: frame()] + W * 2
+def reference():
+    """One of the author's own pages (Extrude), for comparing the volume pages with the approved look."""
+    bpy.ops.curve.primitive_bezier_circle_add(radius=0.5, location=(-8.0, 0.0, 0.0))
+    ex = add("extrude", [bpy.context.object])
+    ex.name = "Reference Extrude"
+
+
+PLAN += [reference, lambda: select("Reference Extrude")] + W * 3 + [lambda: shot("reference_extrude_page")]
 PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume_fog")]
 PLAN += [lambda: select("Letters", 0)] + W * 3 + [lambda: shot("letters_builder")]
 PLAN += drag_steps("Pebble", "Volume Builder") + W * 3 + [lambda: shot("drop_pebble_into_builder")]

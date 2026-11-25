@@ -606,6 +606,12 @@ def test_other_blender_objects():
     vb.update_tag()
     check(bounds(vb)[1][2] > small[1][2] + 0.1, "Radius makes the balls bigger")
     check(em.hide_render, "the emitter (and its particles) don't render under the builder")
+    st.lifetime = 10                                  # by frame 40 they have all died
+    sc.frame_set(1)
+    sc.frame_set(40)
+    update()
+    check(len(feed.data.vertices) == 0, f"dead particles are left out ({len(feed.data.vertices)} left)")
+    st.lifetime = 100
     sc.frame_set(1)
     # other object types
     clear()
