@@ -265,7 +265,16 @@ def test_text_and_fog():
     check(ev.evaluated_geometry().volume is not None, "the builder holds a volume to render")
     vm = add("volume_mesher", [vb])
     check(surface(vm)[1] > 50, "a Mesher still reads it")
-    check(vb.hide_render, "under a Mesher it doesn't render")
+    check(not vb.hide_render, "with Render as Fog it still renders under a Mesher (fog around the surface)")
+    vb.b4d_vol_fog = False
+    update()
+    check(vb.hide_render, "without fog, under a Mesher it doesn't render")
+    vb.b4d_vol_fog = True
+    update()
+    check("b4d_fog_noise" in vb and "b4d_fog_noise_scale" in vb, "fog has Noise and Noise Scale")
+    mat = bpy.data.materials[V.FOG_MATERIAL]
+    check(any(n.bl_idname == "ShaderNodeTexNoise" for n in mat.node_tree.nodes) and mat.get("b4d_fog_v") == V.FOG_VERSION,
+          "the fog material breaks the fog up with noise")
     vm.select_set(False)
     vb.parent = None
     update()
@@ -416,7 +425,125 @@ def test_filter_layers_and_fields():
     check([r.layer for r in vb.b4d_vol_items] == ["", "GROW"], "a layer can be taken out")
 
 
-for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_filter_layers_and_fields, test_switch_off):
+def test_soft_blend_and_field_mix():
+    print("== a soft blend where rows meet, and how fields mix")
+    clear()
+    a = cube("Left", 1.0, (-0.45, 0, 0))
+    b = cube("Right", 1.0, (0.45, 0, 0.3))
+    vb = add("volume_builder", [a, b])
+    order = [r.obj.name for r in vb.b4d_vol_items]
+    row = vb.b4d_vol_items[1]
+    vm = add("volume_mesher", [vb])
+    sharp = surface(vm)
+    row.blend = 30.0
+    update()
+    nodes = [n.bl_idname for n in V.mod_of(vb).node_group.nodes]
+    check("GeometryNodeFieldToGrid" in nodes and "GeometryNodeSDFGridBoolean" in nodes, f"Blend makes a soft join ({order})")
+    soft = surface(vm)
+    check(soft[3] > sharp[3] * 1.01 or soft[1] != sharp[1], f"the corner where they meet is filled in ({sharp[3]} -> {soft[3]})")
+    check(abs(soft[2][0] - sharp[2][0]) < 0.08, f"but the outside stays where it was ({sharp[2]} -> {soft[2]})")
+    row.mode = "SUBTRACT"
+    update()
+    cut = surface(vm)
+    check(cut[1] > 0 and cut[2][0] < sharp[2][0], f"a soft Subtract cuts with a rounded edge ({cut[2]})")
+    row.mode = "INTERSECT"
+    row.blend = 4.0                                   # they overlap by only 10 cm: a wide blend eats it all
+    update()
+    check(surface(vm)[1] > 0, "a soft Intersect gives a volume")
+    row.blend = 30.0
+    row.mode = "ADD"
+    row.blend = 0.0
+    update()
+    check(surface(vm) == sharp, "Blend 0 is the sharp join again")
+    # field mix
+    clear()
+    vb = add("volume_builder", [cube("Block", 2.0)])
+    vb.b4d_vol_index = 0
+    bpy.ops.blenda4d.volume_add_layer(owner=vb.name, effect="GROW")
+    lay = vb.b4d_vol_items[1]
+    lay.grow = 30.0
+    vb.update_tag()
+    fields = []
+    for loc in ((1.2, 0.0, 0.0), (-1.2, 0.0, 0.0)):
+        for o in bpy.context.selected_objects:
+            o.select_set(False)
+        bpy.ops.blenda4d.add_kind(kind="fd_sphere")
+        f = bpy.context.view_layer.objects.active
+        f.location = loc
+        f.b4d_fd_radius = 80.0
+        lay.fields.add().obj = f
+        fields.append(f)
+    update()
+    both = bounds(vb)
+    check(both[1][0] > 1.2 and both[0][0] < -1.2, f"Max: both fields grow it ({both})")
+    lay.fields[1].mix = "SUBTRACT"
+    update()
+    sub = bounds(vb)
+    check(sub[0][0] > -1.06 and sub[1][0] > 1.2, f"Subtract: the second field takes away (only +X grows: {sub})")
+    lay.fields[1].mix = "MULTIPLY"
+    update()
+    mul = bounds(vb)
+    check(mul[0][0] > -1.06 and mul[1][0] < 1.06, f"Multiply: where they don't overlap nothing grows ({mul})")
+    lay.fields[1].mix = "NORMAL"
+    lay.fields[1].opacity = 100.0
+    update()
+    nrm = bounds(vb)
+    check(nrm[0][0] < -1.2 and nrm[1][0] < 1.06, f"Normal at 100%: the second field lies over the first ({nrm})")
+
+
+def test_quad_remesh():
+    print("== Quad Remesh in the Volume Mesher, with symmetry")
+    import mathutils
+    clear()
+    c = cube("Body", 1.4)
+    b = ball("Bump", 0.6, (0.6, 0.0, 0.5))
+    vb = add("volume_builder", [c, b])
+    vm = add("volume_mesher", [vb])
+    live = surface(vm)
+    vm.b4d_vq_faces = 1500
+    r = bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    q = surface(vm)
+    sides = {len(p.vertices) for p in vm.data.polygons}
+    check("FINISHED" in r and sides == {4}, f"the surface becomes quads only ({q[1]} faces, sides {sides})")
+    check(800 < q[1] < 3000, f"about as many as Target Faces ({q[1]})")
+    check(abs(q[2][0] - live[2][0]) < 0.08 and abs(q[2][2] - live[2][2]) < 0.08, f"and keeps the shape ({live[2]} -> {q[2]})")
+    b.location.x += 0.3
+    update()
+    check(surface(vm) == q, "the quads stay while the volume changes, until Update Quads")
+    bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    check(surface(vm)[2][0] > q[2][0] + 0.15, "Update Quads takes the changed volume")
+
+    def err(k):
+        vs = [v.co.copy() for v in vm.data.vertices]
+        kd = mathutils.kdtree.KDTree(len(vs))
+        for n, v in enumerate(vs):
+            kd.insert(v, n)
+        kd.balance()
+        worst = 0.0
+        for v in vs:
+            w = v.copy()
+            w[k] = -w[k]
+            worst = max(worst, kd.find(w)[2])
+        return worst
+    vm.b4d_vq_sym_x = True
+    bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    sx = surface(vm)
+    check(err(0) < 1e-3, f"Symmetry X: the same on both sides ({err(0):.4f})")
+    check(sx[2][0] > 2.0, f"keeping the fuller side, with the bump ({sx[2]})")
+    vm.b4d_vq_sym_x = False
+    vm.b4d_vq_sym_y = True                            # shown Y is up: Blender's Z
+    bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    check(err(2) < 1e-3, f"Symmetry Y mirrors up and down ({err(2):.4f})")
+    vm.b4d_vq_sym_y = False
+    vm.b4d_vq_sym_z = True
+    bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    check(err(1) < 1e-3, f"Symmetry Z mirrors front and back ({err(1):.4f})")
+    bpy.ops.blenda4d.volume_quad_live(owner=vm.name)
+    back = surface(vm)
+    check(not vm.b4d_vq_on and len(vm.data.polygons) == 0 and back[1] > 0, "Back to Live shows the live surface again")
+
+
+for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_filter_layers_and_fields, test_soft_blend_and_field_mix, test_quad_remesh, test_switch_off):
     try:
         t()
     except Exception:

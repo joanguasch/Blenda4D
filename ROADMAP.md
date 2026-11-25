@@ -38,14 +38,16 @@ In: the **Volume Builder** (meshes, splines, text, points and other Volume Build
 volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
 order, with Volume From (Auto, Filled, Surface, Points, Edges), Radius, Grow / Shrink and a Filter (Smooth, Clean,
 Relax, Round) per row; filter layers in the list (Smooth, Clean, Relax, Round, Fillet, Grow / Shrink) that change
-everything above them, each limited to where its fields reach; and Voxel Size, Grow / Shrink,
-Smoothing and Rounding for the whole; the viewport shows it as a surface, voxels or fog; Render as Fog renders it as fog or smoke with its own density and colour) and
+everything above them, each limited to where its fields reach (mixed Max, Normal, Min, Add, Subtract or Multiply);
+a soft Blend where each row meets the ones above; and Voxel Size, Grow / Shrink,
+Smoothing and Rounding for the whole; the viewport shows it as a surface, voxels or fog; Render as Fog renders it as fog or smoke with its own density, colour and noise, also under a Volume Mesher) and
 the **Volume Mesher** (turns the Volume Builder under it into a surface: Threshold, Adaptivity, Smoothing, Smooth
-Shading; the surface takes the Mesher's material).
+Shading; the surface takes the Mesher's material; Quad Remesh with Target Faces, Keep Sharp Edges and Symmetry X, Y, Z).
 Still to do:
-- A soft blend where rows meet, and the field-layer stack (only the strongest field wins today).
+- Quads whose size follows the detail (Blender's QuadriFlow makes evenly sized quads), and Quad Remesh that updates
+  by itself when the volume changes.
 - Particle systems as inputs (Blender's particles can't be read by geometry nodes; point clouds and meshes can).
-- Fog that renders under a Volume Mesher too, and a fog noise for clouds.
+- Fog noise that moves over time.
 
 ## Lights and sky (`lights.py`, `sky.py`)
 - Volumetric glow per light.

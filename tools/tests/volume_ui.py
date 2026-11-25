@@ -318,6 +318,41 @@ PLAN += [lambda: shading("MATERIAL"), lambda: frame()] + W * 2
 PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume_fog")]
 PLAN += [lambda: select("Letters", 0)] + W * 3 + [lambda: shot("letters_builder")]
 PLAN += drag_steps("Pebble", "Volume Builder") + W * 3 + [lambda: shot("drop_pebble_into_builder")]
+def extra(what):
+    V_ = blenda4d.volume
+    w = window()
+    area = max((a for a in w.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.width * a.height)
+    if what == "blend":
+        vb = bpy.data.objects["Volume Builder"]
+        for r in vb.b4d_vol_items:
+            if r.obj is not None and r.obj.name == "Handle":
+                r.blend = 25.0
+                vb.b4d_vol_index = list(vb.b4d_vol_items).index(r)
+        vb.update_tag()
+    elif what == "noise":
+        bv = bpy.data.objects["Bare Volume"]
+        bv["b4d_fog_noise"] = 0.85
+        bv["b4d_fog_noise_scale"] = 35.0
+        bv.update_tag()
+    elif what == "quads":
+        vm = bpy.data.objects["Volume Mesher"]
+        vm.b4d_vq_faces = 2500
+        vm.b4d_vq_sym_x = True
+        with bpy.context.temp_override(window=w, area=area):
+            r = bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+        area.spaces[0].overlay.show_wireframes = True
+        log("QUADS", r, len(vm.data.polygons), {len(p.vertices) for p in vm.data.polygons})
+    elif what == "live":
+        vm = bpy.data.objects["Volume Mesher"]
+        bpy.ops.blenda4d.volume_quad_live(owner=vm.name)
+        area.spaces[0].overlay.show_wireframes = False
+        log("LIVE", len(vm.data.polygons))
+
+
+PLAN += [lambda: shading("MATERIAL"), frame, lambda: extra("blend"), lambda: select("Volume Builder")] + W * 5 + [lambda: shot("soft_blend_handle")]
+PLAN += [lambda: extra("noise"), lambda: select("Bare Volume")] + W * 5 + [lambda: shot("fog_noise")]
+PLAN += [lambda: select("Volume Mesher"), lambda: extra("quads")] + W * 5 + [lambda: shot("mesher_quads_symmetry_x")]
+PLAN += [lambda: extra("live")] + W * 3
 PLAN += [lambda: select("Knob Volume")] + W * 2 + [lambda: shot("nested_builder")]
 PLAN += [lambda: blenda4d.switch.set_mode(False)] + W * 6 + [after_off, lambda: shot("off")]
 PLAN += [lambda: blenda4d.switch.set_mode(True)] + W * 8 + [lambda: select("Volume Mesher"), *W * 2, lambda: shot("on_again")]

@@ -319,17 +319,61 @@ def _layer(G, builder, i, row, grid, voxel):
     if not fs:
         return after
     from . import moclone_fx as fx
-    # where: the strongest field wins (each times its own switch and opacity)
-    w = None
+    w = _field_weight(G, builder, i, fs)
+    return _regrid(G, grid, after, voxel, lambda before, later: _mix(G, w, before, later))
+
+
+FIELD_MIX = [("MAX", "Max", "Take the stronger of this field and the ones above it"),
+             ("NORMAL", "Normal", "Lay this field over the ones above it"),
+             ("MIN", "Min", "Take the weaker of this field and the ones above it"),
+             ("ADD", "Add", "Add this field to the ones above it"),
+             ("SUBTRACT", "Subtract", "Take this field away from the ones above it"),
+             ("MULTIPLY", "Multiply", "Multiply the ones above it by this field")]
+
+
+def _mix(G, t, a, b):
+    nd = G.node("ShaderNodeMix", data_type="FLOAT", clamp_factor=True)
+    G.put(t, nd.inputs[0])
+    G.put(a, nd.inputs[2])
+    G.put(b, nd.inputs[3])
+    return nd.outputs[0]
+
+
+def _field_weight(G, builder, i, fs):
+    """How strongly a filter layer works at each voxel: its fields in list order, each mixed onto the ones above it by
+    its Mix mode, as much as its switch and Opacity say."""
+    from . import moclone_fx as fx
+    w = 0.0
     for j, f in fs:
         on = G.driven(builder, f"b4d_vol_items[{i}].fields[{j}].on", float(f.on))
         op = G.m("MULTIPLY", G.driven(builder, f"b4d_vol_items[{i}].fields[{j}].opacity", f.opacity), 0.01)
-        v = G.m("MULTIPLY", fx.field_value(G.n, G.l, f.obj), G.m("MULTIPLY", on, op))
-        w = v if w is None else G.m("MAXIMUM", w, v)
-    # cells to fill: the inside and a band around both volumes (a distance volume keeps only a band near its surface)
+        v = fx.field_value(G.n, G.l, f.obj)
+        mode = f.mix
+        if mode == "NORMAL":
+            r = v
+        elif mode == "MIN":
+            r = G.m("MINIMUM", w, v)
+        elif mode == "ADD":
+            r = G.m("ADD", w, v)
+        elif mode == "SUBTRACT":
+            r = G.m("SUBTRACT", w, v)
+        elif mode == "MULTIPLY":
+            r = G.m("MULTIPLY", w, v)
+        else:
+            r = G.m("MAXIMUM", w, v)
+        w = _mix(G, G.m("MULTIPLY", on, op), w, r)
+    clamp = G.node("ShaderNodeClamp")
+    G.put(w, clamp.inputs["Value"])
+    return clamp.outputs[0]
+
+
+def _regrid(G, a, b, voxel, value, reach=None):
+    """A new distance volume made voxel by voxel from two others: value(a here, b here) gives its distance. The SDF
+    nodes take no fields, so this fills a volume over both (inside and a band around them, wider by `reach`), then
+    makes a clean distance volume of its surface, which later rows and layers can use."""
     both = G.node("GeometryNodeSDFGridBoolean", operation="UNION")
-    G.l.new(after, both.inputs[1])
-    G.l.new(grid, both.inputs[1])
+    G.l.new(b, both.inputs[1])
+    G.l.new(a, both.inputs[1])
     shell = G.node("GeometryNodeGridToMesh")
     shell.inputs["Threshold"].default_value = 0.0
     G.l.new(both.outputs[0], shell.inputs["Grid"])
@@ -338,34 +382,53 @@ def _layer(G, builder, i, row, grid, voxel):
     G.l.new(voxel, filled.inputs["Voxel Size"])
     wider = G.node("GeometryNodeGridDilateAndErode", data_type="FLOAT")
     G.l.new(filled.outputs[0], wider.inputs["Grid"])
-    wider.inputs["Steps"].default_value = 3
-    mix = G.node("GeometryNodeFieldToGrid", data_type="FLOAT")
-    item = mix.grid_items.new("FLOAT", "Distance")
-    G.l.new(wider.outputs[0], mix.inputs["Topology"])
+    if reach is None:
+        wider.inputs["Steps"].default_value = 3
+    else:
+        G.l.new(G.m("ADD", G.m("CEIL", G.m("DIVIDE", reach, voxel)), 3.0), wider.inputs["Steps"])
+    out = G.node("GeometryNodeFieldToGrid", data_type="FLOAT")
+    item = out.grid_items.new("FLOAT", "Distance")
+    G.l.new(wider.outputs[0], out.inputs["Topology"])
     pos = G.node("GeometryNodeInputPosition").outputs[0]
-    before_v = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
-    G.l.new(grid, before_v.inputs["Grid"])
-    G.l.new(pos, before_v.inputs["Position"])
-    after_v = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
-    G.l.new(after, after_v.inputs["Grid"])
-    G.l.new(pos, after_v.inputs["Position"])
-    blend = G.node("ShaderNodeMix", data_type="FLOAT", clamp_factor=True)
-    G.l.new(w, blend.inputs[0])
-    G.l.new(before_v.outputs["Value"], blend.inputs[2])
-    G.l.new(after_v.outputs["Value"], blend.inputs[3])
-    G.l.new(blend.outputs[0], mix.inputs[item.name] if item.name in mix.inputs else mix.inputs[1])
-    out = G.node("GeometryNodeSetGridBackground", data_type="FLOAT")   # cells left out lie outside
-    G.l.new(mix.outputs[0], out.inputs["Grid"])
-    G.l.new(G.m("MULTIPLY", voxel, 3.0), out.inputs["Background"])
+    here = []
+    for grid in (a, b):
+        sg = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
+        G.l.new(grid, sg.inputs["Grid"])
+        G.l.new(pos, sg.inputs["Position"])
+        here.append(sg.outputs["Value"])
+    G.l.new(value(*here), out.inputs[item.name] if item.name in out.inputs else out.inputs[1])
+    bg = G.node("GeometryNodeSetGridBackground", data_type="FLOAT")    # cells left out lie outside
+    G.l.new(out.outputs[0], bg.inputs["Grid"])
+    G.l.new(G.m("MULTIPLY", voxel, 3.0), bg.inputs["Background"])
     surf = G.node("GeometryNodeGridToMesh")
     surf.inputs["Threshold"].default_value = 0.0
-    G.l.new(out.outputs[0], surf.inputs["Grid"])
-    again = G.node("GeometryNodeMeshToSDFGrid")       # a distance volume again, so what follows can use it
+    G.l.new(bg.outputs[0], surf.inputs["Grid"])
+    again = G.node("GeometryNodeMeshToSDFGrid")
     G.l.new(surf.outputs["Mesh"], again.inputs["Mesh"])
     G.l.new(voxel, again.inputs["Voxel Size"])
     if "Band Width" in again.inputs:
         again.inputs["Band Width"].default_value = 3
     return again.outputs[0]
+
+
+def _soft(G, k, a, b):
+    """Smooth minimum of two distances over k: where they are closer than k the corner between them is filled in."""
+    k = G.m("MAXIMUM", k, 1e-5)
+    h = G.m("DIVIDE", G.m("MAXIMUM", G.m("SUBTRACT", k, G.m("ABSOLUTE", G.m("SUBTRACT", a, b))), 0.0), k)
+    return G.m("SUBTRACT", G.m("MINIMUM", a, b), G.m("MULTIPLY", G.m("MULTIPLY", h, h), G.m("MULTIPLY", k, 0.25)))
+
+
+def _soft_meet(G, builder, i, row, grid, part, voxel):
+    """A row meeting the volume above it with a soft blend of Blend (cm) where they meet."""
+    k = G.cm(G.driven(builder, f"b4d_vol_items[{i}].blend", row.blend))
+    neg = lambda v: G.m("MULTIPLY", v, -1.0)
+    if row.mode == "SUBTRACT":                        # max(a, -b) = -min(-a, b)
+        fn = lambda a, b: neg(_soft(G, k, neg(a), b))
+    elif row.mode == "INTERSECT":                     # max(a, b) = -min(-a, -b)
+        fn = lambda a, b: neg(_soft(G, k, neg(a), neg(b)))
+    else:
+        fn = lambda a, b: _soft(G, k, a, b)
+    return _regrid(G, grid, part, voxel, fn, reach=k)
 
 
 def build_builder(builder):
@@ -385,6 +448,9 @@ def build_builder(builder):
         part = _row_grid(G, builder, i, row, voxel)
         if grid is None:                              # the first row starts the volume, whatever its mode
             grid = part
+            continue
+        if row.blend > 0.0:                           # a soft blend where it meets the rows above
+            grid = _soft_meet(G, builder, i, row, grid, part, voxel)
             continue
         op = G.node("GeometryNodeSDFGridBoolean", operation=BOOLEAN[row.mode])
         many = op.inputs[1]                           # several grids go into one socket (Grid 2)
@@ -542,8 +608,13 @@ def _first(G, shown, store):
 def build_mesher(mesher):
     name = f"Blenda Volume Mesher [{mesher.name}]"
     tree = _new_tree(name, "volume_mesher", mesher)
+    own = tree.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    tree.interface.move(own, 1)                       # the first input: the Mesher's own mesh (the quads, once made)
     G = _G(tree)
     gin, gout = G.node("NodeGroupInput"), G.node("NodeGroupOutput")
+    if mesher.b4d_vq_on:                              # Quad Remesh made: show the quads kept in its own mesh
+        G.l.new(gin.outputs["Geometry"], gout.inputs[0])
+        return tree
     src = builder_of(mesher)
     if src is None:
         G.l.new(G.node("GeometryNodeJoinGeometry").outputs[0], gout.inputs[0])
@@ -582,11 +653,11 @@ def _material(ob):
 def _signature(ob):
     if kind(ob) == "volume_builder":
         live = rows(ob)
-        return ([f"L:{r.layer}:{r.use}:" + ",".join(f.obj.name for _j, f in _fields(r)) if r.layer else
-                 f"{r.obj.name}:{r.mode}:{_input_shape(r.obj, r)}:{r.filter}" for r in ob.b4d_vol_items if r.layer or r in live] +
+        return ([f"L:{r.layer}:{r.use}:" + ",".join(f"{f.obj.name}/{f.mix}" for _j, f in _fields(r)) if r.layer else
+                 f"{r.obj.name}:{r.mode}:{_input_shape(r.obj, r)}:{r.filter}:{r.blend > 0}" for r in ob.b4d_vol_items if r.layer or r in live] +
                 [str(len(ob.b4d_vol_items)), f"fog:{ob.b4d_vol_fog}", f"view:{ob.b4d_vol_view}"])
     src = builder_of(ob)
-    return [src.name if src else "", getattr(_material(ob), "name", "")]
+    return [src.name if src else "", getattr(_material(ob), "name", ""), f"quads:{ob.b4d_vq_on}"]
 
 
 def rebuild(ob):
@@ -655,7 +726,7 @@ def sync(scene):
         for ob in sorted(obs, key=lambda o: kind(o) != "volume_builder"):     # builders first: meshers read them
             if kind(ob) == "volume_builder":
                 _fill_list(ob)
-                if ob.b4d_vol_fog and "b4d_fog_density" not in ob:
+                if ob.b4d_vol_fog and any(k not in ob for k in FOG_PROPS):
                     _sync_fog(ob)
             if _needs_rebuild(ob):
                 rebuild(ob)
@@ -668,6 +739,8 @@ def sync(scene):
         for o in scene.objects:
             if HIDDEN in o and o.name not in keep:
                 _show(o)
+            elif HIDDEN in o and kind(o) == "volume_builder" and o.hide_render == _renders_fog(o):
+                o.hide_render = not _renders_fog(o)
     finally:
         _busy[0] = False
 
@@ -681,7 +754,12 @@ def _hide(ob):
         return
     ob[HIDDEN] = {"display": ob.display_type, "render": int(ob.hide_render)}
     ob.display_type = "BOUNDS" if kind(ob) == "volume_builder" else "WIRE"   # a volume drawn as a wire still shows its fog
-    ob.hide_render = True
+    ob.hide_render = not _renders_fog(ob)
+
+
+def _renders_fog(ob):
+    """A Volume Builder set to Render as Fog keeps rendering under a Volume Mesher: the fog and the surface together."""
+    return kind(ob) == "volume_builder" and ob.b4d_vol_fog
 
 
 def _show(ob):
@@ -713,9 +791,11 @@ def fog_material():
     """One shared volume material: density from the builder's fog grid times the object's Fog Density, coloured by
     its Fog Color (both read from the object, so builders sharing it can differ)."""
     mat = bpy.data.materials.get(FOG_MATERIAL)
-    if mat is not None:
+    if mat is not None and mat.get("b4d_fog_v", 1) >= FOG_VERSION:
         return mat
-    mat = bpy.data.materials.new(FOG_MATERIAL)
+    if mat is None:
+        mat = bpy.data.materials.new(FOG_MATERIAL)
+    mat["b4d_fog_v"] = FOG_VERSION
     mat.use_nodes = True
     nt = mat.node_tree
     nt.nodes.clear()
@@ -731,11 +811,47 @@ def fog_material():
     mul.operation = "MULTIPLY"
     nt.links.new(grid.outputs["Fac"], mul.inputs[0])
     nt.links.new(amount.outputs["Fac"], mul.inputs[1])
-    nt.links.new(mul.outputs[0], vol.inputs["Density"])
+    # noise: clouds the size of Noise Scale (cm, in the object's space), as much as Noise says
+    coord = nt.nodes.new("ShaderNodeTexCoord")
+    nscale = nt.nodes.new("ShaderNodeAttribute")
+    nscale.attribute_type, nscale.attribute_name = "OBJECT", "b4d_fog_noise_scale"
+    per = nt.nodes.new("ShaderNodeMath")
+    per.operation = "DIVIDE"
+    per.inputs[0].default_value = 100.0
+    safe = nt.nodes.new("ShaderNodeMath")
+    safe.operation = "MAXIMUM"
+    safe.inputs[1].default_value = 0.1
+    nt.links.new(nscale.outputs["Fac"], safe.inputs[0])
+    nt.links.new(safe.outputs[0], per.inputs[1])
+    tex = nt.nodes.new("ShaderNodeTexNoise")
+    tex.inputs["Detail"].default_value = 6.0
+    nt.links.new(coord.outputs["Object"], tex.inputs["Vector"])
+    nt.links.new(per.outputs[0], tex.inputs["Scale"])
+    shape = nt.nodes.new("ShaderNodeMapRange")
+    shape.clamp = True
+    shape.inputs["From Min"].default_value, shape.inputs["From Max"].default_value = 0.42, 0.62
+    nt.links.new(tex.outputs["Fac"], shape.inputs["Value"])
+    namount = nt.nodes.new("ShaderNodeAttribute")
+    namount.attribute_type, namount.attribute_name = "OBJECT", "b4d_fog_noise"
+    broken = nt.nodes.new("ShaderNodeMix")
+    broken.data_type = "FLOAT"
+    broken.clamp_factor = True
+    nt.links.new(namount.outputs["Fac"], broken.inputs[0])
+    broken.inputs[2].default_value = 1.0
+    nt.links.new(shape.outputs["Result"], broken.inputs[3])
+    dens = nt.nodes.new("ShaderNodeMath")
+    dens.operation = "MULTIPLY"
+    nt.links.new(mul.outputs[0], dens.inputs[0])
+    nt.links.new(broken.outputs[0], dens.inputs[1])
+    nt.links.new(dens.outputs[0], vol.inputs["Density"])
     nt.links.new(tint.outputs["Color"], vol.inputs["Color"])
     nt.links.new(vol.outputs["Volume"], out.inputs["Volume"])
     vol.inputs["Density Attribute"].default_value = ""
     return mat
+
+
+FOG_PROPS = ("b4d_fog_density", "b4d_fog_color", "b4d_fog_noise", "b4d_fog_noise_scale")
+FOG_VERSION = 2                                       # the material is remade when it is older than this
 
 
 def _sync_fog(ob):
@@ -752,6 +868,14 @@ def _sync_fog(ob):
         if "b4d_fog_color" not in ob:
             ob["b4d_fog_color"] = (0.8, 0.8, 0.8)
             ob.id_properties_ui("b4d_fog_color").update(subtype="COLOR", min=0.0, max=1.0, description="The fog's colour")
+        if "b4d_fog_noise" not in ob:
+            ob["b4d_fog_noise"] = 0.0
+            ob.id_properties_ui("b4d_fog_noise").update(min=0.0, max=1.0, soft_max=1.0,
+                                                        description="Break the fog up into wisps and clouds (0 to 1)")
+        if "b4d_fog_noise_scale" not in ob:
+            ob["b4d_fog_noise_scale"] = 50.0
+            ob.id_properties_ui("b4d_fog_noise_scale").update(min=0.1, soft_max=1000.0,
+                                                              description="How big the clouds of the noise are (cm)")
 
 
 def _fog_changed(self, context):
@@ -786,6 +910,12 @@ def _row_changed(self, context):
     sync_all()
 
 
+def _blend_changed(self, context):
+    if isinstance(self.id_data, bpy.types.Object):
+        self.id_data.update_tag()
+    sync_all()                                        # 0 and above 0 build different nodes
+
+
 def _live(self, context):
     if isinstance(self.id_data, bpy.types.Object):
         self.id_data.update_tag()
@@ -799,6 +929,8 @@ def _is_field(self, ob):
 class BLENDA4D_PG_volume_field(bpy.types.PropertyGroup):
     obj: bpy.props.PointerProperty(type=bpy.types.Object, name="Field", poll=_is_field, update=_row_changed)
     on: bpy.props.BoolProperty(name="On", default=True, description="Use this field", update=_live)
+    mix: bpy.props.EnumProperty(name="Mix", items=FIELD_MIX, default="MAX", update=_row_changed,
+                                description="How this field goes together with the ones above it in the list")
     opacity: bpy.props.FloatProperty(name="Opacity", default=100.0, min=0.0, max=100.0, subtype="PERCENTAGE",
                                      description="How much this field counts", update=_live)
 
@@ -815,6 +947,8 @@ class BLENDA4D_PG_volume_item(bpy.types.PropertyGroup):
                                    description="What part of the object becomes volume")
     radius: bpy.props.FloatProperty(name="Radius", default=10.0, min=0.0, soft_max=1000.0, precision=1,
                                     description="How thick the tubes, balls or shell are (cm)")
+    blend: bpy.props.FloatProperty(name="Blend", default=0.0, min=0.0, soft_max=100.0, precision=1, update=_blend_changed,
+                                   description="Melt this object into the rows above it over this distance (cm): 0 is a sharp edge")
     grow: bpy.props.FloatProperty(name="Grow / Shrink", default=0.0, soft_min=-100.0, soft_max=100.0, precision=1,
                                   description="Make this object's part thicker (positive) or thinner (cm)")
     smooth: bpy.props.IntProperty(name="Smoothing", default=0, min=0, max=50,
@@ -1001,11 +1135,14 @@ def page_builder(col, ob):
         if "b4d_fog_density" in ob:
             sub.prop(ob, '["b4d_fog_density"]', text="Fog Density")
             sub.prop(ob, '["b4d_fog_color"]', text="Fog Color")
+        if "b4d_fog_noise" in ob:
+            sub.prop(ob, '["b4d_fog_noise"]', text="Noise")
+            sub.prop(ob, '["b4d_fog_noise_scale"]', text="Noise Scale (cm)")
         s = slot(ob, "Fog Edge")
         if s is not None:
             sub.prop(*s, text="Fog Edge (cm)")
         if HIDDEN in ob:
-            sub.label(text="Under a Volume Mesher it doesn't render", icon="INFO")
+            sub.label(text="Renders as fog around the Volume Mesher's surface", icon="INFO")
     col.separator()
     col.use_property_split = False
     col.label(text="Objects, in the order they meet")
@@ -1038,6 +1175,8 @@ def page_builder(col, ob):
         shape = _input_shape(row.obj, row)
         if shape in ("tube", "points", "text"):
             box.prop(row, "radius", text="Radius (cm)")
+        if i > 0:
+            box.prop(row, "blend", text="Blend (cm)")
         box.prop(row, "grow", text="Grow / Shrink (cm)")
         box.prop(row, "filter")
         box.prop(row, "smooth", text="Passes")
@@ -1066,7 +1205,7 @@ def _page_layer(col, ob, i, row):
     fl = box.column(align=True)
     for j, it in enumerate(row.fields):
         line = fl.row(align=True)
-        split = line.split(factor=0.62, align=True)
+        split = line.split(factor=0.45, align=True)
         left, right = split.row(align=True), split.row(align=True)
         left.alignment = "LEFT"
         if it.obj is None:
@@ -1076,6 +1215,7 @@ def _page_layer(col, ob, i, row):
             op = left.operator("blenda4d.fx_select", text=it.obj.name, emboss=False,
                                **icons.kw(fx.ICONS.get(it.obj.get("b4d_type"), "DOT"), "fields"))
             op.name = it.obj.name
+            right.prop(it, "mix", text="")
             right.prop(it, "opacity", text="")
         r = right.operator("blenda4d.volume_remove_field", text="", icon="X", emboss=False)
         r.owner, r.index, r.field = ob.name, i, j
@@ -1101,6 +1241,134 @@ def page_mesher(col, ob):
     _settings(col, ob)
     if builder_of(ob) is None:
         col.label(text="Put a Volume Builder under it", icon="INFO")
+        return
+    col.separator()
+    col.label(text="Quad Remesh")
+    col.prop(ob, "b4d_vq_faces")
+    col.prop(ob, "b4d_vq_sharp")
+    row = col.row(heading="Symmetry", align=True)
+    for axis in "xyz":
+        row.prop(ob, f"b4d_vq_sym_{axis}", text=axis.upper(), toggle=True)
+    if ob.b4d_vq_sym_x or ob.b4d_vq_sym_y or ob.b4d_vq_sym_z:
+        col.label(text="Mirrors across the Mesher's centre, keeping the fuller side", icon="MOD_MIRROR")
+    r = col.row(align=True)
+    op = r.operator("blenda4d.volume_quad_remesh", text="Update Quads" if ob.b4d_vq_on else "Remesh to Quads", icon="MOD_REMESH")
+    op.owner = ob.name
+    if ob.b4d_vq_on:
+        op = r.operator("blenda4d.volume_quad_live", text="Back to Live", icon="LOOP_BACK")
+        op.owner = ob.name
+        col.label(text="Showing quads: changes to the volume show after Update Quads", icon="INFO")
+
+
+# --- Quad Remesh -----------------------------------------------------------------------------------------------
+
+SHOWN_AXIS = {"x": 0, "y": 2, "z": 1}                 # the shown axes (Y up) in Blender's space
+
+
+def _live_surface(mesher, context):
+    """The Mesher's surface as it is now made from its Volume Builder, as a new mesh."""
+    was = mesher.b4d_vq_on
+    if was:
+        mesher.b4d_vq_on = False                  # look at the live surface (without the update callback)
+        rebuild(mesher)
+    context.view_layer.update()
+    dg = context.evaluated_depsgraph_get()
+    me = bpy.data.meshes.new_from_object(mesher.evaluated_get(dg))
+    if was:
+        mesher.b4d_vq_on = True
+        rebuild(mesher)
+    return me
+
+
+def quad_remesh(mesher, context):
+    """Remesh the Mesher's surface into quads that follow its shape (Blender's QuadriFlow), kept in the Mesher's own
+    mesh; with symmetry the fuller side is mirrored across the Mesher's centre first, so the quads match too.
+    Returns an error message, or None."""
+    import bmesh
+    me = _live_surface(mesher, context)
+    if not len(me.polygons):
+        bpy.data.meshes.remove(me)
+        return "There is no surface to remesh"
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+    axes = [a for a in "xyz" if getattr(mesher, f"b4d_vq_sym_{a}")]
+    for a in axes:
+        k = SHOWN_AXIS[a]
+        plus = sum(max(v.co[k], 0.0) for v in bm.verts)
+        minus = sum(max(-v.co[k], 0.0) for v in bm.verts)
+        side = "POSITIVE" if plus >= minus else "NEGATIVE"
+        bmesh.ops.symmetrize(bm, input=bm.verts[:] + bm.edges[:] + bm.faces[:], direction=('' if side == "POSITIVE" else '-') + 'XYZ'[k], dist=1e-4)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(me)
+    bm.free()
+    for k in range(3):
+        setattr(me, f"use_mirror_{'xyz'[k]}", any(SHOWN_AXIS[a] == k for a in axes))
+    tmp = bpy.data.objects.new("Blenda Quad Remesh", me)
+    context.scene.collection.objects.link(tmp)
+    try:
+        with context.temp_override(active_object=tmp, object=tmp, selected_objects=[tmp], selected_editable_objects=[tmp]):
+            res = bpy.ops.object.quadriflow_remesh(mode="FACES", target_faces=mesher.b4d_vq_faces, use_mesh_symmetry=bool(axes),
+                                                   use_preserve_sharp=mesher.b4d_vq_sharp, use_preserve_boundary=True, seed=0)
+        quads = tmp.data
+        if "FINISHED" not in res or not len(quads.polygons):
+            return "Quad Remesh failed: the surface needs to be closed, without holes or loose parts"
+        mats = [m for m in mesher.data.materials]
+        old = mesher.data
+        quads.name = old.name
+        mesher.data = quads
+        for m in mats:
+            quads.materials.append(m)
+        for p in quads.polygons:
+            p.use_smooth = bool(value(mesher, "Smooth Shading"))
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
+        mesher.b4d_vq_on = True
+        rebuild(mesher)
+        return None
+    finally:
+        if tmp.name in bpy.data.objects:
+            d = tmp.data
+            bpy.data.objects.remove(tmp)
+            if d is not None and d.users == 0:
+                bpy.data.meshes.remove(d)
+
+
+class BLENDA4D_OT_volume_quad_remesh(bpy.types.Operator):
+    """Remesh the surface into quads that follow its shape. The quads stay until Update Quads or Back to Live"""
+    bl_idname = "blenda4d.volume_quad_remesh"
+    bl_label = "Remesh to Quads"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None or kind(ob) != "volume_mesher":
+            return {"CANCELLED"}
+        err = quad_remesh(ob, context)
+        if err:
+            self.report({"WARNING"}, err)
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"{len(ob.data.polygons)} quads")
+        return {"FINISHED"}
+
+
+class BLENDA4D_OT_volume_quad_live(bpy.types.Operator):
+    """Leave the quads and show the surface made live from the Volume Builder again"""
+    bl_idname = "blenda4d.volume_quad_live"
+    bl_label = "Back to Live"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None or kind(ob) != "volume_mesher":
+            return {"CANCELLED"}
+        ob.b4d_vq_on = False
+        ob.data.clear_geometry()
+        rebuild(ob)
+        sync_all()
+        return {"FINISHED"}
 
 
 # --- drag and drop from the Object Manager ---------------------------------------------------------------------
@@ -1155,7 +1423,8 @@ def _ancestors_and_self(o):
 
 classes = (BLENDA4D_PG_volume_field, BLENDA4D_PG_volume_item, BLENDA4D_UL_volume_items, BLENDA4D_OT_volume_move,
            BLENDA4D_OT_volume_add_layer, BLENDA4D_MT_volume_layer_add, BLENDA4D_OT_volume_remove_layer,
-           BLENDA4D_OT_volume_add_field, BLENDA4D_MT_volume_field_add, BLENDA4D_OT_volume_remove_field)
+           BLENDA4D_OT_volume_add_field, BLENDA4D_MT_volume_field_add, BLENDA4D_OT_volume_remove_field,
+           BLENDA4D_OT_volume_quad_remesh, BLENDA4D_OT_volume_quad_live)
 
 
 def register():
@@ -1172,6 +1441,16 @@ def register():
                ("VOXELS", "Voxels", "Show the volume as a cube on every voxel at its surface"),
                ("FOG", "Fog", "Show the volume as a soft fog")],
         description="How the Volume Builder looks in the viewport (renders are not affected)")
+    O = bpy.types.Object
+    O.b4d_vq_on = bpy.props.BoolProperty(name="Showing Quads", default=False, options={"HIDDEN"})
+    O.b4d_vq_faces = bpy.props.IntProperty(name="Target Faces", default=4000, min=50, soft_max=100000,
+                                           description="About how many quads to make")
+    O.b4d_vq_sharp = bpy.props.BoolProperty(name="Keep Sharp Edges", default=True,
+                                            description="Let the quads follow sharp edges and corners")
+    for axis in "XYZ":
+        setattr(O, f"b4d_vq_sym_{axis.lower()}", bpy.props.BoolProperty(
+            name=f"Symmetry {axis}", default=False,
+            description=f"Make the quads (and the shape) the same on both sides of the Mesher's centre along {axis}"))
     from . import managers
     if drop not in managers.OM_DROP:
         managers.OM_DROP.append(drop)
@@ -1191,7 +1470,8 @@ def unregister():
     from . import managers
     if drop in managers.OM_DROP:
         managers.OM_DROP.remove(drop)
-    for n in ("b4d_vol_items", "b4d_vol_index", "b4d_vol_fog", "b4d_vol_view"):
+    for n in ("b4d_vol_items", "b4d_vol_index", "b4d_vol_fog", "b4d_vol_view", "b4d_vq_on", "b4d_vq_faces", "b4d_vq_sharp",
+              "b4d_vq_sym_x", "b4d_vq_sym_y", "b4d_vq_sym_z"):
         if hasattr(bpy.types.Object, n):
             delattr(bpy.types.Object, n)
     for c in reversed(classes):
