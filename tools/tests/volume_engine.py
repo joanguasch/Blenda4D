@@ -10,11 +10,12 @@ import bpy
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
-from blenda4d import coords, generators as G, kinds, volume as V  # noqa: E402
+from blenda4d import coords, generators as G, kinds, moclone_fx_ui as FXUI, volume as V  # noqa: E402
 
 bpy.utils.register_class(kinds.BLENDA4D_OT_add_kind)
 coords.register()
 G.register()
+FXUI.register()                                       # the fields a filter layer can be limited by
 V.register()
 fails = []
 passed = [0]
@@ -342,7 +343,80 @@ def test_volume_from_and_viewport():
     update()
 
 
-for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_switch_off):
+def bounds(ob):
+    update()
+    ev = ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    me = ev.to_mesh()
+    vs = [v.co.copy() for v in me.vertices]
+    ev.to_mesh_clear()
+    if not vs:
+        return None
+    return [round(min(v[k] for v in vs), 2) for k in range(3)], [round(max(v[k] for v in vs), 2) for k in range(3)]
+
+
+def test_filter_layers_and_fields():
+    print("== filter layers in the list, limited by fields")
+    clear()
+    vb = add("volume_builder", [cube("Block", 2.0)])
+    base = bounds(vb)
+    check(base and abs(base[1][0] - 1.0) < 0.06, f"the block alone ({base})")
+    V.put(vb, "Voxel Size", 3.0)
+    small = bounds(vb)
+    check(small is not None and abs(small[1][0] - 1.0) < 0.05, f"under 4 cm voxels it still shows ({small})")
+    V.put(vb, "Voxel Size", 5.0)
+    vb.b4d_vol_index = 0
+    bpy.ops.blenda4d.volume_add_layer(owner=vb.name, effect="GROW")
+    lay = vb.b4d_vol_items[1]
+    check(lay.layer == "GROW" and lay.obj is None, "a Grow / Shrink layer goes in under the chosen row")
+    lay.grow = 30.0
+    vb.update_tag()
+    update()
+    grown = bounds(vb)
+    check(grown[1][0] > 1.25 and grown[0][0] < -1.25, f"with no fields it grows everywhere ({grown})")
+    check(len(vb.b4d_vol_items) == 2, "the layer stays in the list while the list follows the children")
+    # a spherical field on the +X side: only there it grows
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.ops.blenda4d.add_kind(kind="fd_sphere")
+    fld = bpy.context.view_layer.objects.active
+    fld.location = (1.2, 0.0, 0.0)
+    fld.b4d_fd_radius = 80.0
+    lay.fields.add().obj = fld
+    update()
+    part = bounds(vb)
+    check(part[1][0] > 1.2, f"inside the field it grows ({part[1][0]})")
+    check(part[0][0] > -1.06, f"away from the field it doesn't ({part[0][0]})")
+    fld.location = (-1.2, 0.0, 0.0)
+    update()
+    moved = bounds(vb)
+    check(moved[0][0] < -1.2 and moved[1][0] < 1.06, f"moving the field moves where it grows ({moved[0][0]}, {moved[1][0]})")
+    lay.fields[0].opacity = 0.0
+    update()
+    check(bounds(vb)[0][0] > -1.06, "a field at 0% opacity lets nothing through")
+    lay.fields[0].opacity = 100.0
+    lay.use = False
+    update()
+    check(abs(bounds(vb)[0][0] + 1.0) < 0.06, "a layer switched off does nothing")
+    lay.use = True
+    update()
+    # a Smooth layer after it, then the whole thing meshed
+    vb.b4d_vol_index = 1
+    bpy.ops.blenda4d.volume_add_layer(owner=vb.name, effect="SMOOTH")
+    check([r.layer for r in vb.b4d_vol_items] == ["", "GROW", "SMOOTH"], "layers stack in list order")
+    sm = vb.b4d_vol_items[2]
+    sm.smooth = 6
+    vm = add("volume_mesher", [vb])
+    a = surface(vm)
+    sm.smooth = 0
+    vb.update_tag()
+    check(surface(vm) != a, "the Smooth layer's Passes change the surface")
+    sig = list(vb.get("b4d_vol_sig", []))
+    check(any(x.startswith("L:SMOOTH") for x in sig) and any(fld.name in x for x in sig), "layers and their fields are in the signature")
+    bpy.ops.blenda4d.volume_remove_layer(owner=vb.name, index=2)
+    check([r.layer for r in vb.b4d_vol_items] == ["", "GROW"], "a layer can be taken out")
+
+
+for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_filter_layers_and_fields, test_switch_off):
     try:
         t()
     except Exception:

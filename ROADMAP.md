@@ -37,12 +37,13 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 In: the **Volume Builder** (meshes, splines, text, points and other Volume Builders under it become one distance
 volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
 order, with Volume From (Auto, Filled, Surface, Points, Edges), Radius, Grow / Shrink and a Filter (Smooth, Clean,
-Relax, Round) per row and Voxel Size, Grow / Shrink,
+Relax, Round) per row; filter layers in the list (Smooth, Clean, Relax, Round, Fillet, Grow / Shrink) that change
+everything above them, each limited to where its fields reach; and Voxel Size, Grow / Shrink,
 Smoothing and Rounding for the whole; the viewport shows it as a surface, voxels or fog; Render as Fog renders it as fog or smoke with its own density and colour) and
 the **Volume Mesher** (turns the Volume Builder under it into a surface: Threshold, Adaptivity, Smoothing, Smooth
 Shading; the surface takes the Mesher's material).
 Still to do:
-- Several filters per row in a stack, and a soft blend where rows meet.
+- A soft blend where rows meet, and the field-layer stack (only the strongest field wins today).
 - Particle systems as inputs (Blender's particles can't be read by geometry nodes; point clouds and meshes can).
 - Fog that renders under a Volume Mesher too, and a fog noise for clouds.
 

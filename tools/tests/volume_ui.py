@@ -139,6 +139,25 @@ def scene():
     gem.location = (4.5, 3.5, 0.0)
     gv = add("volume_builder", [gem])
     gv.name = "Gem Volume"
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=(-5.0, 3.0, 0.0))
+    slab = bpy.context.object
+    slab.name = "Slab"
+    lv = add("volume_builder", [slab])
+    lv.name = "Layered Volume"
+    lv.b4d_vol_index = 0
+    bpy.ops.blenda4d.volume_add_layer(owner=lv.name, effect="GROW")
+    lv.b4d_vol_items[1].grow = 40.0
+    bpy.ops.blenda4d.volume_add_layer(owner=lv.name, effect="SMOOTH")
+    lv.b4d_vol_items[2].smooth = 4
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.ops.blenda4d.add_kind(kind="fd_sphere")
+    fld = bpy.context.view_layer.objects.active
+    fld.name = "Grow Zone"
+    fld.location = (-4.0, 3.0, 1.0)
+    fld.b4d_fd_radius = 90.0
+    lv.b4d_vol_items[1].fields.add().obj = fld
+    V.rebuild(lv)
     blenda4d.volume.sync_all()
     log("SCENE", [o.name for o in bpy.data.objects])
 
@@ -273,6 +292,29 @@ PLAN += [lambda: gem("view", "SURFACE"), lambda: gem("source", "POINTS")] + W * 
 PLAN += [lambda: gem("source", "EDGES")] + W * 3 + [lambda: shot("gem_from_edges")]
 PLAN += [lambda: gem("source", "SURFACE")] + W * 3 + [lambda: shot("gem_from_surface")]
 PLAN += [lambda: gem("source", "AUTO"), lambda: shading("MATERIAL")] + W * 3
+def layered(what):
+    ob = bpy.data.objects["Layered Volume"]
+    if what == "fine":
+        V_ = blenda4d.volume
+        V_.put(ob, "Voxel Size", 2.0)
+    elif what == "move":
+        bpy.data.objects["Grow Zone"].location = (-6.0, 3.0, -1.0)
+    ev = ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    log("LAYERED", what, "faces", len(ev.data.polygons) if ev.data else -1, "rows", [r.layer or r.obj.name for r in ob.b4d_vol_items])
+
+
+def look_at(loc, dist):
+    w = window()
+    area = max((a for a in w.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.width * a.height)
+    area.spaces[0].region_3d.view_location = loc
+    area.spaces[0].region_3d.view_distance = dist
+
+
+PLAN += [lambda: shading("SOLID"), lambda: look_at((-5.0, 3.0, 0.0), 8.0), lambda: select("Layered Volume", 1)] + W * 4 + [lambda: layered("start"), lambda: shot("layer_grow_with_field")]
+PLAN += [lambda: select("Layered Volume", 2)] + W * 3 + [lambda: shot("layer_smooth_page")]
+PLAN += [lambda: layered("move")] + W * 4 + [lambda: layered("moved"), lambda: shot("layer_field_moved")]
+PLAN += [lambda: layered("fine")] + W * 6 + [lambda: layered("fine done"), lambda: shot("layer_voxel_2cm")]
+PLAN += [lambda: shading("MATERIAL"), lambda: frame()] + W * 2
 PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume_fog")]
 PLAN += [lambda: select("Letters", 0)] + W * 3 + [lambda: shot("letters_builder")]
 PLAN += drag_steps("Pebble", "Volume Builder") + W * 3 + [lambda: shot("drop_pebble_into_builder")]

@@ -105,6 +105,18 @@ def builder_of(mesher):
     return next((c for c in g.kids_of(mesher) if kind(c) == "volume_builder"), None)
 
 
+# filter layers: rows in the Objects list that change everything made by the rows above them, where their fields reach
+# key: (label, tip, node, has Width, icon)
+LAYERS = {
+    "SMOOTH": ("Smooth", "Soften the volume made so far", "GeometryNodeSDFGridMean", True, "MOD_SMOOTH"),
+    "CLEAN": ("Clean", "Take away small bumps and specks, keeping edges", "GeometryNodeSDFGridMedian", True, "BRUSH_DATA"),
+    "RELAX": ("Relax", "Even out the surface gently", "GeometryNodeSDFGridLaplacian", False, "MOD_SMOOTH"),
+    "ROUND": ("Round", "Round off sharp ridges and points", "GeometryNodeSDFGridMeanCurvature", False, "SPHERECURVE"),
+    "FILLET": ("Fillet", "Fill in inner corners and creases", "GeometryNodeSDFGridFillet", False, "MOD_BEVEL"),
+    "GROW": ("Grow / Shrink", "Make the volume made so far thicker (positive) or thinner", "GeometryNodeSDFGridOffset", False, "FULLSCREEN_ENTER"),
+}
+
+
 SOURCES = [
     ("AUTO", "Auto", "Pick from the object: closed meshes are filled, splines become tubes, flat text a shell, loose points balls"),
     ("FILLED", "Filled", "The whole inside of a closed mesh (needs a mesh without holes)"),
@@ -285,6 +297,77 @@ def _row_grid(G, builder, i, row, voxel):
     return smooth.outputs[0]
 
 
+def _fields(row):
+    from . import moclone_fx as fx
+    return [(j, f) for j, f in enumerate(row.fields) if f.obj is not None and fx.is_field(f.obj)]
+
+
+def _layer(G, builder, i, row, grid, voxel):
+    """A filter layer: its effect on the volume made so far. With fields, it works only as strongly as they say at each
+    voxel: the volume before and after are blended voxel by voxel, then made a clean distance volume again."""
+    _label, _tip, idname, width, _icon = LAYERS[row.layer]
+    nd = G.node(idname)
+    G.l.new(grid, nd.inputs["Grid"])
+    if row.layer == "GROW":
+        G.l.new(G.cm(G.driven(builder, f"b4d_vol_items[{i}].grow", row.grow)), nd.inputs["Distance"])
+    else:
+        if width:
+            nd.inputs["Width"].default_value = 1
+        G.l.new(G.m("ROUND", G.driven(builder, f"b4d_vol_items[{i}].smooth", row.smooth)), nd.inputs["Iterations"])
+    after = nd.outputs[0]
+    fs = _fields(row)
+    if not fs:
+        return after
+    from . import moclone_fx as fx
+    # where: the strongest field wins (each times its own switch and opacity)
+    w = None
+    for j, f in fs:
+        on = G.driven(builder, f"b4d_vol_items[{i}].fields[{j}].on", float(f.on))
+        op = G.m("MULTIPLY", G.driven(builder, f"b4d_vol_items[{i}].fields[{j}].opacity", f.opacity), 0.01)
+        v = G.m("MULTIPLY", fx.field_value(G.n, G.l, f.obj), G.m("MULTIPLY", on, op))
+        w = v if w is None else G.m("MAXIMUM", w, v)
+    # cells to fill: the inside and a band around both volumes (a distance volume keeps only a band near its surface)
+    both = G.node("GeometryNodeSDFGridBoolean", operation="UNION")
+    G.l.new(after, both.inputs[1])
+    G.l.new(grid, both.inputs[1])
+    shell = G.node("GeometryNodeGridToMesh")
+    shell.inputs["Threshold"].default_value = 0.0
+    G.l.new(both.outputs[0], shell.inputs["Grid"])
+    filled = G.node("GeometryNodeMeshToDensityGrid")
+    G.l.new(shell.outputs["Mesh"], filled.inputs["Mesh"])
+    G.l.new(voxel, filled.inputs["Voxel Size"])
+    wider = G.node("GeometryNodeGridDilateAndErode", data_type="FLOAT")
+    G.l.new(filled.outputs[0], wider.inputs["Grid"])
+    wider.inputs["Steps"].default_value = 3
+    mix = G.node("GeometryNodeFieldToGrid", data_type="FLOAT")
+    item = mix.grid_items.new("FLOAT", "Distance")
+    G.l.new(wider.outputs[0], mix.inputs["Topology"])
+    pos = G.node("GeometryNodeInputPosition").outputs[0]
+    before_v = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
+    G.l.new(grid, before_v.inputs["Grid"])
+    G.l.new(pos, before_v.inputs["Position"])
+    after_v = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
+    G.l.new(after, after_v.inputs["Grid"])
+    G.l.new(pos, after_v.inputs["Position"])
+    blend = G.node("ShaderNodeMix", data_type="FLOAT", clamp_factor=True)
+    G.l.new(w, blend.inputs[0])
+    G.l.new(before_v.outputs["Value"], blend.inputs[2])
+    G.l.new(after_v.outputs["Value"], blend.inputs[3])
+    G.l.new(blend.outputs[0], mix.inputs[item.name] if item.name in mix.inputs else mix.inputs[1])
+    out = G.node("GeometryNodeSetGridBackground", data_type="FLOAT")   # cells left out lie outside
+    G.l.new(mix.outputs[0], out.inputs["Grid"])
+    G.l.new(G.m("MULTIPLY", voxel, 3.0), out.inputs["Background"])
+    surf = G.node("GeometryNodeGridToMesh")
+    surf.inputs["Threshold"].default_value = 0.0
+    G.l.new(out.outputs[0], surf.inputs["Grid"])
+    again = G.node("GeometryNodeMeshToSDFGrid")       # a distance volume again, so what follows can use it
+    G.l.new(surf.outputs["Mesh"], again.inputs["Mesh"])
+    G.l.new(voxel, again.inputs["Voxel Size"])
+    if "Band Width" in again.inputs:
+        again.inputs["Band Width"].default_value = 3
+    return again.outputs[0]
+
+
 def build_builder(builder):
     name = f"Blenda Volume Builder [{builder.name}]"
     tree = _new_tree(name, "volume_builder", builder)
@@ -293,6 +376,10 @@ def build_builder(builder):
     voxel = G.cm(G.m("MAXIMUM", gin.outputs["Voxel Size"], 0.1))
     grid = None
     for i, row in enumerate(builder.b4d_vol_items):
+        if row.layer:
+            if grid is not None and row.use and row.layer in LAYERS:
+                grid = _layer(G, builder, i, row, grid, voxel)
+            continue
         if row not in rows(builder):
             continue
         part = _row_grid(G, builder, i, row, voxel)
@@ -344,6 +431,7 @@ def build_builder(builder):
         # surface): thick inside, fading out over Fog Edge across the surface
         outline = G.node("GeometryNodeGridToMesh")
         G.l.new(fillet.outputs[0], outline.inputs["Grid"])
+        outline.inputs["Threshold"].default_value = 0.0   # its own default (10 cm) lies outside a thin band
         box = G.node("GeometryNodeBoundBox")
         G.l.new(outline.outputs["Mesh"], box.inputs["Geometry"])
         edge = G.m("MAXIMUM", G.cm(gin.outputs["Fog Edge"]), 0.0001)
@@ -431,6 +519,8 @@ def build_builder(builder):
     else:
         surf = G.node("GeometryNodeGridToMesh")
         G.l.new(fillet.outputs[0], surf.inputs["Grid"])
+        surf.inputs["Threshold"].default_value = 0.0      # the volume's edge; the default (10 cm) is outside a band
+                                                          # three voxels wide once voxels are under ~3.4 cm
         look = surf.outputs["Mesh"]
     gate = G.node("GeometryNodeSwitch", input_type="GEOMETRY")     # the mesh is only a preview: none in renders
     G.l.new(G.node("GeometryNodeIsViewport").outputs[0], gate.inputs["Switch"])
@@ -491,7 +581,9 @@ def _material(ob):
 
 def _signature(ob):
     if kind(ob) == "volume_builder":
-        return ([f"{r.obj.name}:{r.mode}:{_input_shape(r.obj, r)}:{r.filter}" for r in rows(ob)] +
+        live = rows(ob)
+        return ([f"L:{r.layer}:{r.use}:" + ",".join(f.obj.name for _j, f in _fields(r)) if r.layer else
+                 f"{r.obj.name}:{r.mode}:{_input_shape(r.obj, r)}:{r.filter}" for r in ob.b4d_vol_items if r.layer or r in live] +
                 [str(len(ob.b4d_vol_items)), f"fog:{ob.b4d_vol_fog}", f"view:{ob.b4d_vol_view}"])
     src = builder_of(ob)
     return [src.name if src else "", getattr(_material(ob), "name", "")]
@@ -536,9 +628,11 @@ def _fill_list(builder):
     kids = [c for c in g.kids_of(builder) if usable(c)]
     lst = builder.b4d_vol_items
     for i in reversed(range(len(lst))):
+        if lst[i].layer:                              # filter layers are not objects: they stay
+            continue
         if lst[i].obj is None or lst[i].obj not in kids:
             lst.remove(i)
-    have = {r.obj for r in lst}
+    have = {r.obj for r in lst if not r.layer}
     for c in kids:
         if c not in have:
             r = lst.add()
@@ -692,8 +786,27 @@ def _row_changed(self, context):
     sync_all()
 
 
+def _live(self, context):
+    if isinstance(self.id_data, bpy.types.Object):
+        self.id_data.update_tag()
+
+
+def _is_field(self, ob):
+    from . import moclone_fx as fx
+    return fx.is_field(ob)
+
+
+class BLENDA4D_PG_volume_field(bpy.types.PropertyGroup):
+    obj: bpy.props.PointerProperty(type=bpy.types.Object, name="Field", poll=_is_field, update=_row_changed)
+    on: bpy.props.BoolProperty(name="On", default=True, description="Use this field", update=_live)
+    opacity: bpy.props.FloatProperty(name="Opacity", default=100.0, min=0.0, max=100.0, subtype="PERCENTAGE",
+                                     description="How much this field counts", update=_live)
+
+
 class BLENDA4D_PG_volume_item(bpy.types.PropertyGroup):
     obj: bpy.props.PointerProperty(type=bpy.types.Object, name="Object")
+    layer: bpy.props.StringProperty(name="Filter Layer", description="Not empty for a filter layer: which effect")
+    fields: bpy.props.CollectionProperty(type=BLENDA4D_PG_volume_field)
     use: bpy.props.BoolProperty(name="Use", default=True, update=_row_changed,
                                 description="Leave this object out for a while without taking it out from under the Volume Builder")
     mode: bpy.props.EnumProperty(name="Mode", items=MODES, default="ADD", update=_row_changed,
@@ -716,6 +829,11 @@ class BLENDA4D_UL_volume_items(bpy.types.UIList):
         row.prop(item, "use", text="")
         sub = row.row()
         sub.active = item.use
+        if item.layer:
+            label, _tip, _n, _w, icon_ = LAYERS.get(item.layer, ("?", "", "", False, "QUESTION"))
+            n = len(_fields(item))
+            sub.label(text=f"{label} (filter)" + (f" · {n} field{'s' if n > 1 else ''}" if n else ""), icon=icon_)
+            return
         ob = item.obj
         sub.label(text=ob.name if ob else "(gone)", icon=kinds.KINDS.get(kind(ob), {}).get("icon", "OBJECT_DATA")
                   if kind(ob) else {"MESH": "MESH_DATA", "CURVE": "CURVE_DATA", "POINTCLOUD": "POINTCLOUD_DATA", "FONT": "FONT_DATA"}.get(
@@ -741,6 +859,121 @@ class BLENDA4D_OT_volume_move(bpy.types.Operator):
         ob.b4d_vol_items.move(i, j)
         ob.b4d_vol_index = j
         rebuild(ob)                                   # the drivers point at rows by number
+        sync_all()
+        return {"FINISHED"}
+
+
+class BLENDA4D_OT_volume_add_layer(bpy.types.Operator):
+    """Add a filter layer under the chosen row: it changes everything made by the rows above it"""
+    bl_idname = "blenda4d.volume_add_layer"
+    bl_label = "Add Filter Layer"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+    effect: bpy.props.EnumProperty(items=[(k, v[0], v[1]) for k, v in LAYERS.items()])
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None:
+            return {"CANCELLED"}
+        lst = ob.b4d_vol_items
+        it = lst.add()
+        it.layer = self.effect
+        it.smooth = 2
+        it.grow = max(1.0, value(ob, "Voxel Size") or 5.0) * 2.0
+        at = min(ob.b4d_vol_index + 1, len(lst) - 1) if len(lst) > 1 else 0
+        lst.move(len(lst) - 1, at)
+        ob.b4d_vol_index = at
+        rebuild(ob)
+        sync_all()
+        return {"FINISHED"}
+
+
+class BLENDA4D_MT_volume_layer_add(bpy.types.Menu):
+    bl_label = "Add Filter Layer"
+    bl_idname = "BLENDA4D_MT_volume_layer_add"
+
+    def draw(self, context):
+        ob = context.view_layer.objects.active
+        for k, (label, _tip, _n, _w, icon) in LAYERS.items():
+            op = self.layout.operator("blenda4d.volume_add_layer", text=label, icon=icon)
+            op.owner, op.effect = getattr(ob, "name", ""), k
+
+
+class BLENDA4D_OT_volume_remove_layer(bpy.types.Operator):
+    """Take this filter layer out of the list"""
+    bl_idname = "blenda4d.volume_remove_layer"
+    bl_label = "Remove Filter Layer"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+    index: bpy.props.IntProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None or not (0 <= self.index < len(ob.b4d_vol_items)) or not ob.b4d_vol_items[self.index].layer:
+            return {"CANCELLED"}
+        ob.b4d_vol_items.remove(self.index)
+        ob.b4d_vol_index = max(0, min(ob.b4d_vol_index, len(ob.b4d_vol_items) - 1))
+        rebuild(ob)
+        sync_all()
+        return {"FINISHED"}
+
+
+class BLENDA4D_OT_volume_add_field(bpy.types.Operator):
+    """Make a new field and limit the chosen filter layer to where it reaches"""
+    bl_idname = "blenda4d.volume_add_field"
+    bl_label = "Add Field"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+    index: bpy.props.IntProperty(options={"HIDDEN"})
+    field: bpy.props.StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None or not (0 <= self.index < len(ob.b4d_vol_items)):
+            return {"CANCELLED"}
+        for o in context.selected_objects:            # the new field is made on its own, not with the builder selected
+            o.select_set(False)
+        bpy.ops.blenda4d.add_kind(kind=self.field)
+        f = context.view_layer.objects.active
+        if f is None or f == ob:
+            return {"CANCELLED"}
+        f.location = ob.matrix_world.translation
+        it = ob.b4d_vol_items[self.index].fields.add()
+        it.obj = f
+        rebuild(ob)
+        sync_all()
+        return {"FINISHED"}
+
+
+class BLENDA4D_MT_volume_field_add(bpy.types.Menu):
+    bl_label = "Add Field"
+    bl_idname = "BLENDA4D_MT_volume_field_add"
+
+    def draw(self, context):
+        from . import moclone_fx as fx
+        ob = getattr(context, "b4d_vol_owner", None) or context.view_layer.objects.active
+        for k, (label, _tip) in fx.FIELDS.items():
+            op = self.layout.operator("blenda4d.volume_add_field", text=label, icon=fx.ICONS.get(k, "SPHERE"))
+            op.owner, op.index, op.field = ob.name, ob.b4d_vol_index, k
+
+
+class BLENDA4D_OT_volume_remove_field(bpy.types.Operator):
+    """Take this field out of the layer's list (the field stays in the scene)"""
+    bl_idname = "blenda4d.volume_remove_field"
+    bl_label = "Remove Field"
+    bl_options = {"REGISTER", "UNDO"}
+    owner: bpy.props.StringProperty(options={"HIDDEN"})
+    index: bpy.props.IntProperty(options={"HIDDEN"})
+    field: bpy.props.IntProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.owner)
+        if ob is None or not (0 <= self.index < len(ob.b4d_vol_items)):
+            return {"CANCELLED"}
+        fs = ob.b4d_vol_items[self.index].fields
+        if 0 <= self.field < len(fs):
+            fs.remove(self.field)
+        rebuild(ob)
         sync_all()
         return {"FINISHED"}
 
@@ -782,7 +1015,12 @@ def page_builder(col, ob):
     for icon, step in (("TRIA_UP", -1), ("TRIA_DOWN", 1)):
         op = side.operator("blenda4d.volume_move", text="", icon=icon)
         op.owner, op.step = ob.name, step
+    col.menu("BLENDA4D_MT_volume_layer_add", text="Add Filter Layer", icon="ADD")
     lst = ob.b4d_vol_items
+    i = ob.b4d_vol_index
+    if 0 <= i < len(lst) and lst[i].layer:
+        _page_layer(col, ob, i, lst[i])
+        return
     if not len(lst):
         col.label(text="Drag meshes, splines, text, points or Volume Builders here or under it", icon="INFO")
         return
@@ -805,6 +1043,45 @@ def page_builder(col, ob):
         box.prop(row, "smooth", text="Passes")
         if shape == "solid" and row.obj.type == "MESH" and len(row.obj.data.polygons) and not _closed(row.obj):
             box.label(text="This mesh has holes: its inside may come out wrong", icon="ERROR")
+
+
+def _page_layer(col, ob, i, row):
+    from . import icons
+    from . import moclone_fx as fx
+    label, tip, _n, _w, _icon = LAYERS.get(row.layer, ("?", "", "", False, ""))
+    box = col.column()
+    box.use_property_split = True
+    head = box.row()
+    head.label(text=f"Filter layer: {label}")
+    rm = head.operator("blenda4d.volume_remove_layer", text="", icon="X", emboss=False)
+    rm.owner, rm.index = ob.name, i
+    box.label(text="Works on everything made by the rows above it", icon="INFO")
+    if row.layer == "GROW":
+        box.prop(row, "grow", text="Distance (cm)")
+    else:
+        box.prop(row, "smooth", text="Passes")
+    box.separator()
+    box.use_property_split = False
+    box.label(text="Fields: where it works (none: everywhere)")
+    fl = box.column(align=True)
+    for j, it in enumerate(row.fields):
+        line = fl.row(align=True)
+        split = line.split(factor=0.62, align=True)
+        left, right = split.row(align=True), split.row(align=True)
+        left.alignment = "LEFT"
+        if it.obj is None:
+            left.label(text="(gone)", icon="ERROR")
+        else:
+            left.prop(it, "on", text="")
+            op = left.operator("blenda4d.fx_select", text=it.obj.name, emboss=False,
+                               **icons.kw(fx.ICONS.get(it.obj.get("b4d_type"), "DOT"), "fields"))
+            op.name = it.obj.name
+            right.prop(it, "opacity", text="")
+        r = right.operator("blenda4d.volume_remove_field", text="", icon="X", emboss=False)
+        r.owner, r.index, r.field = ob.name, i, j
+    if not len(row.fields):
+        fl.label(text="Drag fields here from the Object Manager", icon="INFO")
+    box.menu("BLENDA4D_MT_volume_field_add", text="Add Field", icon="ADD")
 
 
 def _closed(ob):
@@ -837,6 +1114,20 @@ def drop(context, objs, event):
     ob = context.view_layer.objects.active
     if over is None or kind(ob) is None:
         return False
+    from . import moclone_fx as fx
+    lst = getattr(ob, "b4d_vol_items", None)
+    if kind(ob) == "volume_builder" and lst is not None and 0 <= ob.b4d_vol_index < len(lst) and lst[ob.b4d_vol_index].layer:
+        row = lst[ob.b4d_vol_index]                   # fields let go over a filter layer's page join its Fields list
+        took = False
+        for o in objs:
+            if fx.is_field(o) and all(f.obj != o for f in row.fields):
+                row.fields.add().obj = o
+                took = True
+        if took:
+            rebuild(ob)
+            sync_all()
+            over.tag_redraw()
+            return True
     if kind(ob) == "volume_mesher":
         objs = [o for o in objs if kind(o) == "volume_builder"][:1] if builder_of(ob) is None else []
     else:
@@ -862,7 +1153,9 @@ def _ancestors_and_self(o):
 
 # --- registration ----------------------------------------------------------------------------------------------
 
-classes = (BLENDA4D_PG_volume_item, BLENDA4D_UL_volume_items, BLENDA4D_OT_volume_move)
+classes = (BLENDA4D_PG_volume_field, BLENDA4D_PG_volume_item, BLENDA4D_UL_volume_items, BLENDA4D_OT_volume_move,
+           BLENDA4D_OT_volume_add_layer, BLENDA4D_MT_volume_layer_add, BLENDA4D_OT_volume_remove_layer,
+           BLENDA4D_OT_volume_add_field, BLENDA4D_MT_volume_field_add, BLENDA4D_OT_volume_remove_field)
 
 
 def register():
