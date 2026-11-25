@@ -33,6 +33,13 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 - More deformers.
 - Displace from an image, a gentler smoothing mode, a wave that fades with distance, a Shrinkwrap offset.
 
+## Volumes (`volume.py`) — in progress, pull request "Volume Builder and Volume Mesher"
+- **Volume Builder**: its children (meshes, splines, points, other Volume Builders) become one volume, each child added,
+  subtracted or intersected in list order, with a voxel size and smoothing filters per child; output as a distance or
+  a density volume.
+- **Volume Mesher**: turns the Volume Builder under it back into a mesh, with threshold, adaptivity and smoothing.
+- Both on Blender's own volume grid nodes, settings on the object, so files work with the add-on off.
+
 ## Lights and sky (`lights.py`, `sky.py`)
 - Volumetric glow per light.
 - Sun shadow quality settings.
@@ -76,4 +83,4 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 ## Platform
 - Testing on Windows and Linux (the add-on is plain Python and should already run there).
 - Checking the tinted icons on high-resolution (Retina) displays.
-- Volume tools, character tools and simulation pages.
+- Character tools and simulation pages.
