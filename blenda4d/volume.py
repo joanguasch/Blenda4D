@@ -1257,6 +1257,12 @@ def page_mesher(col, ob):
     if ob.b4d_vq_on:
         op = r.operator("blenda4d.volume_quad_live", text="Back to Live", icon="LOOP_BACK")
         op.owner = ob.name
+    msg = str(ob.get("b4d_vq_msg", ""))
+    if msg.startswith("!"):
+        col.label(text=msg[1:], icon="ERROR")
+    elif msg and ob.b4d_vq_on:
+        col.label(text=msg, icon="CHECKMARK")
+    if ob.b4d_vq_on:
         col.label(text="Showing quads: changes to the volume show after Update Quads", icon="INFO")
 
 
@@ -1280,58 +1286,125 @@ def _live_surface(mesher, context):
     return me
 
 
-def quad_remesh(mesher, context):
-    """Remesh the Mesher's surface into quads that follow its shape (Blender's QuadriFlow), kept in the Mesher's own
-    mesh; with symmetry the fuller side is mirrored across the Mesher's centre first, so the quads match too.
-    Returns an error message, or None."""
-    import bmesh
-    me = _live_surface(mesher, context)
-    if not len(me.polygons):
-        bpy.data.meshes.remove(me)
-        return "There is no surface to remesh"
-    bm = bmesh.new()
-    bm.from_mesh(me)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
-    axes = [a for a in "xyz" if getattr(mesher, f"b4d_vq_sym_{a}")]
-    for a in axes:
-        k = SHOWN_AXIS[a]
-        plus = sum(max(v.co[k], 0.0) for v in bm.verts)
-        minus = sum(max(-v.co[k], 0.0) for v in bm.verts)
-        side = "POSITIVE" if plus >= minus else "NEGATIVE"
-        bmesh.ops.symmetrize(bm, input=bm.verts[:] + bm.edges[:] + bm.faces[:], direction=('' if side == "POSITIVE" else '-') + 'XYZ'[k], dist=1e-4)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.to_mesh(me)
-    bm.free()
-    for k in range(3):
-        setattr(me, f"use_mirror_{'xyz'[k]}", any(SHOWN_AXIS[a] == k for a in axes))
+QF_INPUT = 20                                         # QuadriFlow needs only the shape: about this many faces per quad wanted
+
+
+def _quadriflow(context, me, mesher, sym):
+    """Run QuadriFlow on a copy holding `me`; returns the new mesh or None."""
     tmp = bpy.data.objects.new("Blenda Quad Remesh", me)
     context.scene.collection.objects.link(tmp)
     try:
         with context.temp_override(active_object=tmp, object=tmp, selected_objects=[tmp], selected_editable_objects=[tmp]):
-            res = bpy.ops.object.quadriflow_remesh(mode="FACES", target_faces=mesher.b4d_vq_faces, use_mesh_symmetry=bool(axes),
+            res = bpy.ops.object.quadriflow_remesh(mode="FACES", target_faces=mesher.b4d_vq_faces, use_mesh_symmetry=sym,
                                                    use_preserve_sharp=mesher.b4d_vq_sharp, use_preserve_boundary=True, seed=0)
-        quads = tmp.data
-        if "FINISHED" not in res or not len(quads.polygons):
-            return "Quad Remesh failed: the surface needs to be closed, without holes or loose parts"
+        out = tmp.data
+        if "FINISHED" not in res or not len(out.polygons) or any(len(p.vertices) != 4 for p in out.polygons[:50]):
+            return None
+        tmp.data = bpy.data.meshes.new("_")                # keep the result when the helper goes
+        return out
+    finally:
+        d = tmp.data
+        bpy.data.objects.remove(tmp)
+        if d is not None and d.users == 0:
+            bpy.data.meshes.remove(d)
+
+
+def _repaired(context, me, voxel):
+    """A copy of `me` remade watertight by Blender's voxel remesh at `voxel` (m): it also cuts a very fine surface
+    down quickly, and mends tiny holes, pinches and stray bits."""
+    tmp = bpy.data.objects.new("Blenda Quad Remesh", me.copy())
+    context.scene.collection.objects.link(tmp)
+    try:
+        tmp.data.remesh_voxel_size = voxel
+        with context.temp_override(active_object=tmp, object=tmp, selected_objects=[tmp], selected_editable_objects=[tmp]):
+            bpy.ops.object.voxel_remesh()
+        out = tmp.data
+        tmp.data = bpy.data.meshes.new("_")
+        return out
+    finally:
+        d = tmp.data
+        bpy.data.objects.remove(tmp)
+        if d is not None and d.users == 0:
+            bpy.data.meshes.remove(d)
+
+
+def quad_remesh(mesher, context):
+    """Remesh the Mesher's surface into quads that follow its shape (Blender's QuadriFlow), kept in the Mesher's own
+    mesh; with symmetry the fuller side is mirrored across the Mesher's centre first, so the quads match too. A very
+    fine surface is cut down first (QuadriFlow only needs the shape); if QuadriFlow refuses the surface it is tried
+    once more on a watertight copy. The outcome is kept in b4d_vq_msg for the page. Returns an error message, or None."""
+    import bmesh
+    import time
+    t0 = time.time()
+    wm = context.window_manager
+    wm.progress_begin(0, 4)
+    made = []
+    try:
+        me = _live_surface(mesher, context)
+        made.append(me)
+        if not len(me.polygons):
+            return _said(mesher, "There is no surface to remesh")
+        wm.progress_update(1)
+        want = mesher.b4d_vq_faces * QF_INPUT
+        if len(me.polygons) > want * 1.5:              # very fine: QuadriFlow needs only the shape, so cut it down first
+            import numpy as np
+            areas = np.empty(len(me.polygons), dtype=np.float32)
+            me.polygons.foreach_get("area", areas)
+            me = _repaired(context, me, max(1e-4, float(np.sqrt(areas.sum() / want))))
+            made.append(me)
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+        axes = [a for a in "xyz" if getattr(mesher, f"b4d_vq_sym_{a}")]
+        for a in axes:
+            k = SHOWN_AXIS[a]
+            plus = sum(max(v.co[k], 0.0) for v in bm.verts)
+            minus = sum(max(-v.co[k], 0.0) for v in bm.verts)
+            bmesh.ops.symmetrize(bm, input=bm.verts[:] + bm.edges[:] + bm.faces[:],
+                                 direction=("" if plus >= minus else "-") + "XYZ"[k], dist=1e-4)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bm.to_mesh(me)
+        bm.free()
+        for k in range(3):
+            setattr(me, f"use_mirror_{'xyz'[k]}", any(SHOWN_AXIS[a] == k for a in axes))
+        wm.progress_update(2)
+        quads = _quadriflow(context, me, mesher, bool(axes))
+        if quads is None:                              # pinches, tiny holes or stray bits: make it watertight, try again
+            src = builder_of(mesher)
+            voxel = max(0.001, (value(src, "Voxel Size") or 5.0) * SCALE) if src else 0.05
+            fixed = _repaired(context, me, voxel)
+            made.append(fixed)
+            for k in range(3):
+                setattr(fixed, f"use_mirror_{'xyz'[k]}", getattr(me, f"use_mirror_{'xyz'[k]}"))
+            wm.progress_update(3)
+            quads = _quadriflow(context, fixed, mesher, bool(axes))
+        if quads is None:
+            return _said(mesher, "Quad Remesh failed on this surface: try fewer Target Faces or a larger Voxel Size")
         mats = [m for m in mesher.data.materials]
         old = mesher.data
         quads.name = old.name
         mesher.data = quads
         for m in mats:
             quads.materials.append(m)
+        smooth = bool(value(mesher, "Smooth Shading"))
         for p in quads.polygons:
-            p.use_smooth = bool(value(mesher, "Smooth Shading"))
+            p.use_smooth = smooth
         if old.users == 0:
             bpy.data.meshes.remove(old)
         mesher.b4d_vq_on = True
         rebuild(mesher)
+        _said(mesher, f"{len(quads.polygons)} quads in {time.time() - t0:.1f} s", ok=True)
         return None
     finally:
-        if tmp.name in bpy.data.objects:
-            d = tmp.data
-            bpy.data.objects.remove(tmp)
-            if d is not None and d.users == 0:
-                bpy.data.meshes.remove(d)
+        wm.progress_end()
+        for m in made:
+            if m.name in bpy.data.meshes and m.users == 0:
+                bpy.data.meshes.remove(m)
+
+
+def _said(mesher, text, ok=False):
+    mesher["b4d_vq_msg"] = ("" if ok else "!") + text
+    return None if ok else text
 
 
 class BLENDA4D_OT_volume_quad_remesh(bpy.types.Operator):

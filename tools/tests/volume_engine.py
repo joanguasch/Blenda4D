@@ -538,6 +538,38 @@ def test_quad_remesh():
     vm.b4d_vq_sym_z = True
     bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
     check(err(1) < 1e-3, f"Symmetry Z mirrors front and back ({err(1):.4f})")
+    check(str(vm.get("b4d_vq_msg", "")).endswith(" s") and "quads" in vm["b4d_vq_msg"], f"the page says how it went ({vm.get('b4d_vq_msg')})")
+    # QuadriFlow refusing the surface: tried again on a watertight copy
+    real = V._quadriflow
+    calls = []
+
+    def refuse_first(*a):
+        calls.append(1)
+        return None if len(calls) == 1 else real(*a)
+    V._quadriflow = refuse_first
+    try:
+        bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    finally:
+        V._quadriflow = real
+    check(len(calls) == 2 and vm.b4d_vq_on and {len(p.vertices) for p in vm.data.polygons} == {4},
+          "when QuadriFlow refuses the surface it works on a mended copy")
+    V._quadriflow = lambda *a: None
+    try:
+        r = bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    finally:
+        V._quadriflow = real
+    check("CANCELLED" in r and str(vm["b4d_vq_msg"]).startswith("!"), "when it still fails, the page keeps the reason")
+    # a very fine volume is cut down before QuadriFlow, and stays quick
+    import time
+    vm.b4d_vq_sym_z = False
+    V.put(vb, "Voxel Size", 1.0)
+    bpy.ops.blenda4d.volume_quad_live(owner=vm.name)
+    fine = surface(vm)[1]
+    t = time.time()
+    bpy.ops.blenda4d.volume_quad_remesh(owner=vm.name)
+    took = time.time() - t
+    check(vm.b4d_vq_on and len(vm.data.polygons) < 3000 and took < 30, f"a fine surface ({fine} faces) is remeshed in {took:.1f} s")
+    V.put(vb, "Voxel Size", 5.0)
     bpy.ops.blenda4d.volume_quad_live(owner=vm.name)
     back = surface(vm)
     check(not vm.b4d_vq_on and len(vm.data.polygons) == 0 and back[1] > 0, "Back to Live shows the live surface again")
