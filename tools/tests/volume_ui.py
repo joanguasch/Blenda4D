@@ -119,6 +119,21 @@ def scene():
     ring.name = "Ring"
     alone = add("volume_builder", [ring])
     alone.name = "Bare Volume"
+    alone.b4d_vol_fog = True                          # rendered as fog, so Material Preview shows it
+    alone["b4d_fog_color"] = (0.4, 0.7, 1.0)
+    cu = bpy.data.curves.new("Word", "FONT")
+    cu.body = "VOL"
+    word = bpy.data.objects.new("Word", cu)
+    word.location = (-1.5, -4.0, -0.5)
+    word.rotation_euler = (math.radians(90), 0, 0)
+    bpy.context.collection.objects.link(word)
+    letters = add("volume_builder", [word])
+    letters.name = "Letters"
+    lm = add("volume_mesher", [letters])
+    lm.name = "Letters Mesher"
+    lm.data.materials.append(material("Mint", (0.3, 0.8, 0.6, 1)))
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, location=(0.0, -1.5, -0.6))
+    bpy.context.object.name = "Pebble"
     blenda4d.volume.sync_all()
     log("SCENE", [o.name for o in bpy.data.objects])
 
@@ -140,6 +155,61 @@ def select(name, row=None):
     bpy.context.window_manager.b4d_am_tab = "OBJECT"
     if row is not None:
         ob.b4d_vol_index = row
+
+
+def om_region():
+    from blenda4d import roles
+    a = roles.areas(window().screen, "OBJECTS")[0]
+    return a, next(r for r in a.regions if r.type == "WINDOW")
+
+
+def row_y(name):
+    from blenda4d import managers
+    _a, r = om_region()
+    rows = [o.name for o, _d in managers.visible_rows(bpy.context)]
+    h = managers.row_height()
+    vy = -(managers.rows_top() + rows.index(name) + 0.5) * h
+    return r.y + int(r.view2d.view_to_region(0, vy, clip=False)[1])
+
+
+def ev(t, v, x, y):
+    window().event_simulate(t, v, x=x, y=y)
+
+
+_drag = {}
+
+
+def drag_steps(src, owner):
+    """Press on src's row in the Object Manager, move to the middle of the Attribute Manager (showing owner), let go."""
+    from blenda4d import roles
+
+    def show_row():
+        only([bpy.data.objects[src]])
+        a, r = om_region()
+        with bpy.context.temp_override(window=window(), area=a, region=r):
+            bpy.ops.blenda4d.om_scroll_active()
+
+    def press():
+        only([bpy.data.objects[owner]])
+        bpy.context.window_manager.b4d_am_tab = "OBJECT"
+        _a, r = om_region()
+        am = roles.areas(window().screen, "ATTRIBUTES")[0]
+        _drag.update(x0=r.x + 90, y0=row_y(src), x1=am.x + am.width // 2, y1=am.y + am.height // 2)
+        ev("MOUSEMOVE", "NOTHING", _drag["x0"], _drag["y0"])
+        ev("LEFTMOUSE", "PRESS", _drag["x0"], _drag["y0"])
+    steps = [show_row, lambda: None, lambda: None, press]
+    for k in range(1, 9):
+        steps.append(lambda k=k: ev("MOUSEMOVE", "NOTHING", _drag["x0"] + (_drag["x1"] - _drag["x0"]) * k // 8,
+                                    _drag["y0"] + (_drag["y1"] - _drag["y0"]) * k // 8))
+    steps += [lambda: ev("LEFTMOUSE", "RELEASE", _drag["x1"], _drag["y1"]), lambda: None,
+              lambda: log("DROP", src, "->", owner, "parent", getattr(bpy.data.objects[src].parent, "name", None),
+                          "rows", [r.obj.name for r in bpy.data.objects[owner].b4d_vol_items if r.obj])]
+    return steps
+
+
+def set_filter(name, row, f):
+    bpy.data.objects[name].b4d_vol_items[row].filter = f
+    bpy.data.objects[name].b4d_vol_items[row].smooth = 4
 
 
 def set_mode(name, row, mode):
@@ -178,7 +248,11 @@ PLAN += [lambda: select("Volume Builder", 1)] + W * 3 + [lambda: shot("builder_p
 PLAN += [lambda: select("Volume Builder", 2)] + W * 2 + [lambda: shot("builder_page_spline_row")]
 PLAN += [lambda: set_mode("Volume Builder", 1, "INTERSECT")] + W * 3 + [lambda: shot("builder_hole_intersect")]
 PLAN += [lambda: set_mode("Volume Builder", 1, "SUBTRACT")] + W * 2
-PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume")]
+PLAN += [lambda: set_filter("Volume Builder", 0, "CURVATURE")] + W * 3 + [lambda: select("Volume Builder", 0)] + W * 2
+PLAN += [lambda: shot("builder_box_row_round_filter")]
+PLAN += [lambda: select("Bare Volume")] + W * 3 + [lambda: shot("bare_volume_fog")]
+PLAN += [lambda: select("Letters", 0)] + W * 3 + [lambda: shot("letters_builder")]
+PLAN += drag_steps("Pebble", "Volume Builder") + W * 3 + [lambda: shot("drop_pebble_into_builder")]
 PLAN += [lambda: select("Knob Volume")] + W * 2 + [lambda: shot("nested_builder")]
 PLAN += [lambda: blenda4d.switch.set_mode(False)] + W * 6 + [after_off, lambda: shot("off")]
 PLAN += [lambda: blenda4d.switch.set_mode(True)] + W * 8 + [lambda: select("Volume Mesher"), *W * 2, lambda: shot("on_again")]

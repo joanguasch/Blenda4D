@@ -155,6 +155,17 @@ def test_builder_and_mesher():
     row = vb.b4d_vol_items[i]
     row_change(vb, row, "grow", 10.0, "Grow / Shrink", vm)
     row_change(vb, row, "smooth", 4, "Smoothing", vm)
+    row.smooth = 3
+    update()
+    seen = {"MEAN": surface(vm)}
+    for f in ("MEDIAN", "LAPLACIAN", "CURVATURE"):
+        row.filter = f
+        update()
+        seen[f] = surface(vm)
+        check(seen[f] != seen["MEAN"], f"row Filter {f.title()} filters differently from Smooth")
+    row.filter = "MEAN"
+    row.smooth = 0
+    update()
     full = surface(vm)
     row.use = False
     update()
@@ -222,6 +233,47 @@ def test_splines_points_and_nesting():
     check(surface(vm)[2][1] > s[2][1] + 0.3, "and its volume is part of the outer one")
 
 
+def test_text_and_fog():
+    print("== text, and Render as Fog")
+    clear()
+    cu = bpy.data.curves.new("Word", "FONT")
+    cu.body = "HI"
+    word = bpy.data.objects.new("Word", cu)
+    bpy.context.collection.objects.link(word)
+    vb = add("volume_builder", [word])
+    vm = add("volume_mesher", [vb])
+    flat = surface(vm)
+    check(flat[1] > 50 and flat[2][2] > 0.01, f"flat letters become rounded letters ({flat[1]} faces, {flat[2]})")
+    row_change(vb, vb.b4d_vol_items[0], "radius", 6.0, "Radius (text)", vm)
+    cu.extrude = 0.2
+    update()
+    solid = surface(vm)
+    check(abs(solid[2][2] - 0.4) < 0.12, f"extruded letters are filled as they are ({solid[2]})")
+    # fog
+    clear()
+    vb = add("volume_builder", [cube("Box", 1.0)])
+    vb.b4d_vol_fog = True
+    update()
+    setm = [n for n in V.mod_of(vb).node_group.nodes if n.bl_idname == "GeometryNodeSetMaterial"]
+    check(setm and setm[0].inputs["Material"].default_value.name == V.FOG_MATERIAL,
+          "Render as Fog puts the fog material on the volume")
+    check("b4d_fog_density" in vb and "b4d_fog_color" in vb, "and its own Fog Density and Fog Color")
+    tree = V.mod_of(vb).node_group
+    check(any(n.bl_idname == "GeometryNodeVolumeCube" for n in tree.nodes), "the fog is a filled grid over the volume's bounds")
+    ev = vb.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    check(ev.evaluated_geometry().volume is not None, "the builder holds a volume to render")
+    vm = add("volume_mesher", [vb])
+    check(surface(vm)[1] > 50, "a Mesher still reads it")
+    check(vb.hide_render, "under a Mesher it doesn't render")
+    vm.select_set(False)
+    vb.parent = None
+    update()
+    check(not vb.hide_render, "out from under the Mesher it renders again")
+    vb.b4d_vol_fog = False
+    update()
+    check(not any(n.bl_idname == "GeometryNodeVolumeCube" for n in V.mod_of(vb).node_group.nodes), "and the filled grid")
+
+
 def test_switch_off():
     print("== the file works with the module off")
     clear()
@@ -237,7 +289,7 @@ def test_switch_off():
     V.register()
 
 
-for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_switch_off):
+for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_switch_off):
     try:
         t()
     except Exception:

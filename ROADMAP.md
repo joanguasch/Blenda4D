@@ -34,15 +34,16 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 - Displace from an image, a gentler smoothing mode, a wave that fades with distance, a Shrinkwrap offset.
 
 ## Volumes (`volume.py`)
-In: the **Volume Builder** (meshes, splines, points and other Volume Builders under it become one distance volume; an
-Objects list adds, subtracts or intersects each one in order, with Radius, Grow / Shrink and Smoothing per row and
-Voxel Size, Grow / Shrink, Smoothing and Rounding for the whole) and the **Volume Mesher** (turns the Volume Builder
-under it into a surface: Threshold, Adaptivity, Smoothing, Smooth Shading; the surface takes the Mesher's material).
+In: the **Volume Builder** (meshes, splines, text, points and other Volume Builders under it become one distance
+volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
+order, with Radius, Grow / Shrink and a Filter (Smooth, Clean, Relax, Round) per row and Voxel Size, Grow / Shrink,
+Smoothing and Rounding for the whole; Render as Fog renders it as fog or smoke with its own density and colour) and
+the **Volume Mesher** (turns the Volume Builder under it into a surface: Threshold, Adaptivity, Smoothing, Smooth
+Shading; the surface takes the Mesher's material).
 Still to do:
-- A fog (density) output for rendering a Volume Builder as smoke or clouds, with a ready volume material.
-- More filters per row, in a stack (dilate and erode, median, curvature), and a smooth blend between rows.
-- Text objects and particles as inputs; a Volume Builder that reads a Cloner's copies.
-- Drag and drop into the Objects list from the Object Manager.
+- Several filters per row in a stack, and a soft blend where rows meet.
+- Particle systems as inputs (Blender's particles can't be read by geometry nodes; point clouds and meshes can).
+- Fog that renders under a Volume Mesher too, and a fog noise for clouds.
 
 ## Lights and sky (`lights.py`, `sky.py`)
 - Volumetric glow per light.

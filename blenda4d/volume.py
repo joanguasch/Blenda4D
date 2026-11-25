@@ -34,6 +34,7 @@ INPUTS = {
         ("Grow / Shrink", "FLOAT", 0.0, -1000.0, 1000.0, "Make the whole volume thicker (positive) or thinner (cm)"),
         ("Smoothing", "INT", 0, 0, 50, "Round the whole volume off: how many passes"),
         ("Rounding", "INT", 0, 0, 50, "Fill in hollows and creases only, leaving the rest: how many passes"),
+        ("Fog Edge", "FLOAT", 5.0, 0.0, 1000.0, "With Render as Fog: how far the fog fades out across the surface (cm)"),
     ],
     "volume_mesher": [
         ("Threshold", "FLOAT", 0.0, -1000.0, 1000.0, "Where the surface is taken: positive lies outside the volume's edge (cm)"),
@@ -46,7 +47,13 @@ MODES = [("ADD", "Add", "Join this object to the volume above it", "ADD", 0),
          ("SUBTRACT", "Subtract", "Cut this object out of the volume above it", "REMOVE", 1),
          ("INTERSECT", "Intersect", "Keep only where this object and the volume above it overlap", "SELECT_INTERSECT", 2)]
 BOOLEAN = {"ADD": "UNION", "SUBTRACT": "DIFFERENCE", "INTERSECT": "INTERSECT"}
-INPUT_TYPES = ("MESH", "CURVE", "POINTCLOUD")
+INPUT_TYPES = ("MESH", "CURVE", "POINTCLOUD", "FONT")
+# the per-row filter: (key, label, tip, node, has Width)
+FILTERS = [("MEAN", "Smooth", "Average the shape out: softens everything", "GeometryNodeSDFGridMean", True),
+           ("MEDIAN", "Clean", "Take off small bumps and specks, keep larger edges", "GeometryNodeSDFGridMedian", True),
+           ("LAPLACIAN", "Relax", "Let the surface settle evenly, like a soap film", "GeometryNodeSDFGridLaplacian", False),
+           ("CURVATURE", "Round", "Round off sharp corners and fill thin grooves first", "GeometryNodeSDFGridMeanCurvature", False)]
+FOG_MATERIAL = "Blenda Volume Fog"
 
 
 def kind(ob):
@@ -104,6 +111,9 @@ def _input_shape(ob):
         return "builder"
     if ob.type == "CURVE":
         return "tube"
+    if ob.type == "FONT":                             # flat letters have no inside: they become rounded letters
+        cu = ob.data
+        return "solid" if (cu.extrude > 0 or cu.bevel_depth > 0) else "text"
     if ob.type == "POINTCLOUD" or (ob.type == "MESH" and len(ob.data.polygons) == 0):
         return "points"
     return "solid"
@@ -201,6 +211,14 @@ def _row_grid(G, builder, i, row, voxel):
             sdf = G.node("GeometryNodeMeshToSDFGrid")
             G.l.new(tube.outputs["Mesh"], sdf.inputs["Mesh"])
             G.l.new(voxel, sdf.inputs["Voxel Size"])
+        elif shape == "text":                         # points spread over the letters, each a ball of Radius
+            spread = G.node("GeometryNodeDistributePointsOnFaces", distribute_method="RANDOM")
+            G.l.new(geo, spread.inputs["Mesh"])
+            G.l.new(G.m("DIVIDE", 4.0, G.m("MULTIPLY", voxel, voxel)), spread.inputs["Density"])
+            sdf = G.node("GeometryNodePointsToSDFGrid")
+            G.l.new(spread.outputs["Points"], sdf.inputs["Points"])
+            G.l.new(radius, sdf.inputs["Radius"])
+            G.l.new(voxel, sdf.inputs["Voxel Size"])
         elif shape == "points":
             pts = G.node("GeometryNodeMeshToPoints")
             G.l.new(geo, pts.inputs["Mesh"])
@@ -221,9 +239,11 @@ def _row_grid(G, builder, i, row, voxel):
     off = G.node("GeometryNodeSDFGridOffset")         # positive Distance grows the surface
     G.l.new(grid, off.inputs["Grid"])
     G.l.new(G.cm(G.driven(builder, f"b4d_vol_items[{i}].grow", row.grow)), off.inputs["Distance"])
-    smooth = G.node("GeometryNodeSDFGridMean")
+    _key, _label, _tip, idname, width = next(f for f in FILTERS if f[0] == row.filter)
+    smooth = G.node(idname)
     G.l.new(off.outputs[0], smooth.inputs["Grid"])
-    smooth.inputs["Width"].default_value = 1
+    if width:
+        smooth.inputs["Width"].default_value = 1
     G.l.new(G.m("ROUND", G.driven(builder, f"b4d_vol_items[{i}].smooth", row.smooth)), smooth.inputs["Iterations"])
     return smooth.outputs[0]
 
@@ -282,6 +302,51 @@ def build_builder(builder):
     G.l.new(voxel, dens.inputs["From Max"])
     dens.inputs["To Min"].default_value, dens.inputs["To Max"].default_value = 1.0, 0.0
     G.l.new(dens.outputs["Result"], fog.inputs[item.name] if item.name in fog.inputs else fog.inputs[1])
+    if builder.b4d_vol_fog:
+        # Render as Fog: a filled density grid over the volume's bounds (the distance grid only has cells near the
+        # surface): thick inside, fading out over Fog Edge across the surface
+        outline = G.node("GeometryNodeGridToMesh")
+        G.l.new(fillet.outputs[0], outline.inputs["Grid"])
+        box = G.node("GeometryNodeBoundBox")
+        G.l.new(outline.outputs["Mesh"], box.inputs["Geometry"])
+        edge = G.m("MAXIMUM", G.cm(gin.outputs["Fog Edge"]), 0.0001)
+        pad = G.node("ShaderNodeVectorMath", operation="SCALE")
+        pad.inputs[0].default_value = (1.0, 1.0, 1.0)
+        G.l.new(G.m("ADD", edge, voxel), pad.inputs["Scale"])
+        lo = G.node("ShaderNodeVectorMath", operation="SUBTRACT")
+        G.l.new(box.outputs["Min"], lo.inputs[0])
+        G.l.new(pad.outputs[0], lo.inputs[1])
+        hi = G.node("ShaderNodeVectorMath", operation="ADD")
+        G.l.new(box.outputs["Max"], hi.inputs[0])
+        G.l.new(pad.outputs[0], hi.inputs[1])
+        size = G.node("ShaderNodeVectorMath", operation="SUBTRACT")
+        G.l.new(hi.outputs[0], size.inputs[0])
+        G.l.new(lo.outputs[0], size.inputs[1])
+        xyz = G.node("ShaderNodeSeparateXYZ")
+        G.l.new(size.outputs[0], xyz.inputs[0])
+        cube = G.node("GeometryNodeVolumeCube")
+        G.l.new(lo.outputs[0], cube.inputs["Min"])
+        G.l.new(hi.outputs[0], cube.inputs["Max"])
+        for axis, k in (("X", 0), ("Y", 1), ("Z", 2)):
+            G.l.new(G.m("MINIMUM", G.m("CEIL", G.m("DIVIDE", xyz.outputs[k], voxel)), 160.0), cube.inputs[f"Resolution {axis}"])
+        inside = G.node("GeometryNodeSampleGrid", data_type="FLOAT")
+        G.l.new(fillet.outputs[0], inside.inputs["Grid"])
+        G.l.new(G.node("GeometryNodeInputPosition").outputs[0], inside.inputs["Position"])
+        thick = G.node("ShaderNodeMapRange", clamp=True)
+        G.l.new(inside.outputs["Value"], thick.inputs["Value"])
+        G.l.new(G.m("MULTIPLY", edge, -1.0), thick.inputs["From Min"])
+        thick.inputs["From Max"].default_value = 0.0
+        thick.inputs["To Min"].default_value, thick.inputs["To Max"].default_value = 1.0, 0.0
+        G.l.new(thick.outputs["Result"], cube.inputs["Density"])
+        keep = G.node("GeometryNodeStoreNamedGrid", data_type="FLOAT")     # the distance grid goes along
+        keep.inputs["Name"].default_value = GRID
+        G.l.new(cube.outputs["Volume"], keep.inputs["Volume"])
+        G.l.new(fillet.outputs[0], keep.inputs["Grid"])
+        setm = G.node("GeometryNodeSetMaterial")        # a volume made in nodes renders with its own material only
+        G.l.new(keep.outputs[0], setm.inputs["Geometry"])
+        setm.inputs["Material"].default_value = fog_material()
+        G.l.new(setm.outputs[0], gout.inputs[0])
+        return tree
     shown = G.node("GeometryNodeStoreNamedGrid", data_type="FLOAT")
     shown.inputs["Name"].default_value = "density"
     G.l.new(store.outputs[0], shown.inputs["Volume"])
@@ -332,7 +397,8 @@ def _material(ob):
 
 def _signature(ob):
     if kind(ob) == "volume_builder":
-        return [f"{r.obj.name}:{r.mode}:{_input_shape(r.obj)}" for r in rows(ob)] + [str(len(ob.b4d_vol_items))]
+        return ([f"{r.obj.name}:{r.mode}:{_input_shape(r.obj)}:{r.filter}" for r in rows(ob)] +
+                [str(len(ob.b4d_vol_items)), f"fog:{ob.b4d_vol_fog}"])
     src = builder_of(ob)
     return [src.name if src else "", getattr(_material(ob), "name", "")]
 
@@ -401,6 +467,8 @@ def sync(scene):
         for ob in sorted(obs, key=lambda o: kind(o) != "volume_builder"):     # builders first: meshers read them
             if kind(ob) == "volume_builder":
                 _fill_list(ob)
+                if ob.b4d_vol_fog and "b4d_fog_density" not in ob:
+                    _sync_fog(ob)
             if _needs_rebuild(ob):
                 rebuild(ob)
             if enabled(ob):
@@ -451,6 +519,58 @@ def _on_update(scene, depsgraph=None):
     sync(scene)
 
 
+# --- Render as Fog ---------------------------------------------------------------------------------------------
+
+def fog_material():
+    """One shared volume material: density from the builder's fog grid times the object's Fog Density, coloured by
+    its Fog Color (both read from the object, so builders sharing it can differ)."""
+    mat = bpy.data.materials.get(FOG_MATERIAL)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(FOG_MATERIAL)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    vol = nt.nodes.new("ShaderNodeVolumePrincipled")
+    grid = nt.nodes.new("ShaderNodeAttribute")
+    grid.attribute_type, grid.attribute_name = "GEOMETRY", "density"
+    amount = nt.nodes.new("ShaderNodeAttribute")
+    amount.attribute_type, amount.attribute_name = "OBJECT", "b4d_fog_density"
+    tint = nt.nodes.new("ShaderNodeAttribute")
+    tint.attribute_type, tint.attribute_name = "OBJECT", "b4d_fog_color"
+    mul = nt.nodes.new("ShaderNodeMath")
+    mul.operation = "MULTIPLY"
+    nt.links.new(grid.outputs["Fac"], mul.inputs[0])
+    nt.links.new(amount.outputs["Fac"], mul.inputs[1])
+    nt.links.new(mul.outputs[0], vol.inputs["Density"])
+    nt.links.new(tint.outputs["Color"], vol.inputs["Color"])
+    nt.links.new(vol.outputs["Volume"], out.inputs["Volume"])
+    vol.inputs["Density Attribute"].default_value = ""
+    return mat
+
+
+def _sync_fog(ob):
+    """Render as Fog on: the builder gets its own Fog Density and Fog Color (the fog material, set on the volume in
+    its nodes, reads them from the object). Also takes away a fog material an earlier version put in its slots."""
+    mats = ob.data.materials
+    for i in reversed(range(len(mats))):
+        if mats[i] is not None and mats[i].name == FOG_MATERIAL:
+            mats.pop(index=i)
+    if ob.b4d_vol_fog:
+        if "b4d_fog_density" not in ob:
+            ob["b4d_fog_density"] = 5.0
+            ob.id_properties_ui("b4d_fog_density").update(min=0.0, soft_max=100.0, description="How thick the fog is")
+        if "b4d_fog_color" not in ob:
+            ob["b4d_fog_color"] = (0.8, 0.8, 0.8)
+            ob.id_properties_ui("b4d_fog_color").update(subtype="COLOR", min=0.0, max=1.0, description="The fog's colour")
+
+
+def _fog_changed(self, context):
+    _sync_fog(self)
+    sync_all()
+
+
 # --- making them -----------------------------------------------------------------------------------------------
 
 def create(context, k):
@@ -489,7 +609,9 @@ class BLENDA4D_PG_volume_item(bpy.types.PropertyGroup):
     grow: bpy.props.FloatProperty(name="Grow / Shrink", default=0.0, soft_min=-100.0, soft_max=100.0, precision=1,
                                   description="Make this object's part thicker (positive) or thinner (cm)")
     smooth: bpy.props.IntProperty(name="Smoothing", default=0, min=0, max=50,
-                                  description="Round this object's part off before it meets the rows above: how many passes")
+                                  description="Filter this object's part before it meets the rows above: how many passes")
+    filter: bpy.props.EnumProperty(name="Filter", items=[(k, label, tip) for k, label, tip, _n, _w in FILTERS], default="MEAN",
+                                   update=_row_changed, description="How this object's part is smoothed")
 
 
 class BLENDA4D_UL_volume_items(bpy.types.UIList):
@@ -500,7 +622,7 @@ class BLENDA4D_UL_volume_items(bpy.types.UIList):
         sub.active = item.use
         ob = item.obj
         sub.label(text=ob.name if ob else "(gone)", icon=kinds.KINDS.get(kind(ob), {}).get("icon", "OBJECT_DATA")
-                  if kind(ob) else {"MESH": "MESH_DATA", "CURVE": "CURVE_DATA", "POINTCLOUD": "POINTCLOUD_DATA"}.get(
+                  if kind(ob) else {"MESH": "MESH_DATA", "CURVE": "CURVE_DATA", "POINTCLOUD": "POINTCLOUD_DATA", "FONT": "FONT_DATA"}.get(
                       getattr(ob, "type", ""), "OBJECT_DATA"))
         sub.prop(item, "mode", text="", icon_only=True, emboss=False)
 
@@ -538,7 +660,21 @@ def _settings(col, ob):
 
 def page_builder(col, ob):
     col.use_property_split = True
-    _settings(col, ob)
+    for sname in ("Voxel Size", "Grow / Shrink", "Smoothing", "Rounding"):
+        s = slot(ob, sname)
+        if s is not None:
+            col.prop(*s, text=sname + (" (cm)" if sname in ("Voxel Size", "Grow / Shrink") else ""))
+    col.prop(ob, "b4d_vol_fog")
+    if ob.b4d_vol_fog:
+        sub = col.column()
+        if "b4d_fog_density" in ob:
+            sub.prop(ob, '["b4d_fog_density"]', text="Fog Density")
+            sub.prop(ob, '["b4d_fog_color"]', text="Fog Color")
+        s = slot(ob, "Fog Edge")
+        if s is not None:
+            sub.prop(*s, text="Fog Edge (cm)")
+        if HIDDEN in ob:
+            sub.label(text="Under a Volume Mesher it doesn't render", icon="INFO")
     col.separator()
     col.use_property_split = False
     col.label(text="Objects, in the order they meet")
@@ -550,7 +686,7 @@ def page_builder(col, ob):
         op.owner, op.step = ob.name, step
     lst = ob.b4d_vol_items
     if not len(lst):
-        col.label(text="Put meshes, splines, points or other Volume Builders under it", icon="INFO")
+        col.label(text="Drag meshes, splines, text, points or Volume Builders here or under it", icon="INFO")
         return
     i = ob.b4d_vol_index
     if 0 <= i < len(lst) and lst[i].obj is not None:
@@ -561,10 +697,11 @@ def page_builder(col, ob):
         box.prop(row, "mode")
         if i == 0:
             box.label(text="The first row starts the volume", icon="INFO")
-        if _input_shape(row.obj) in ("tube", "points"):
+        if _input_shape(row.obj) in ("tube", "points", "text"):
             box.prop(row, "radius", text="Radius (cm)")
         box.prop(row, "grow", text="Grow / Shrink (cm)")
-        box.prop(row, "smooth")
+        box.prop(row, "filter")
+        box.prop(row, "smooth", text="Passes")
         if _input_shape(row.obj) == "solid" and not _closed(row.obj):
             box.label(text="This mesh has holes: its inside may come out wrong", icon="ERROR")
 
@@ -588,6 +725,40 @@ def page_mesher(col, ob):
         col.label(text="Put a Volume Builder under it", icon="INFO")
 
 
+# --- drag and drop from the Object Manager ---------------------------------------------------------------------
+
+def drop(context, objs, event):
+    """Objects let go over a Volume Builder's page go under it (keeping their place in the world) and so join its list;
+    a Volume Builder let go over a Volume Mesher's page goes under that."""
+    from . import roles
+    over = next((a for a in context.window.screen.areas if roles.role(a) == "ATTRIBUTES"
+                 and a.x <= event.mouse_x < a.x + a.width and a.y <= event.mouse_y < a.y + a.height), None)
+    ob = context.view_layer.objects.active
+    if over is None or kind(ob) is None:
+        return False
+    if kind(ob) == "volume_mesher":
+        objs = [o for o in objs if kind(o) == "volume_builder"][:1] if builder_of(ob) is None else []
+    else:
+        objs = [o for o in objs if usable(o) and o != ob and ob not in _ancestors_and_self(o)]
+    for o in objs:
+        mw = o.matrix_world.copy()
+        o.parent = ob
+        o.matrix_parent_inverse.identity()
+        o.matrix_world = mw
+    if objs:
+        sync_all()
+        over.tag_redraw()
+    return bool(objs)
+
+
+def _ancestors_and_self(o):
+    out = []
+    while o is not None:
+        out.append(o)
+        o = o.parent
+    return out
+
+
 # --- registration ----------------------------------------------------------------------------------------------
 
 classes = (BLENDA4D_PG_volume_item, BLENDA4D_UL_volume_items, BLENDA4D_OT_volume_move)
@@ -598,6 +769,12 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Object.b4d_vol_items = bpy.props.CollectionProperty(type=BLENDA4D_PG_volume_item)
     bpy.types.Object.b4d_vol_index = bpy.props.IntProperty(default=0)
+    bpy.types.Object.b4d_vol_fog = bpy.props.BoolProperty(
+        name="Render as Fog", default=False, update=_fog_changed,
+        description="Render the volume as fog or smoke (a volume material reads it), not only feed a Volume Mesher")
+    from . import managers
+    if drop not in managers.OM_DROP:
+        managers.OM_DROP.append(drop)
     pages = {"volume_builder": page_builder, "volume_mesher": page_mesher}
     for k in ("volume_builder", "volume_mesher"):
         kinds.add(k, LABELS[k], ICONS[k], create=(lambda k: lambda context: create(context, k))(k),
@@ -611,7 +788,10 @@ def register():
 def unregister():
     if _on_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_update)
-    for n in ("b4d_vol_items", "b4d_vol_index"):
+    from . import managers
+    if drop in managers.OM_DROP:
+        managers.OM_DROP.remove(drop)
+    for n in ("b4d_vol_items", "b4d_vol_index", "b4d_vol_fog"):
         if hasattr(bpy.types.Object, n):
             delattr(bpy.types.Object, n)
     for c in reversed(classes):
