@@ -34,9 +34,9 @@ own file under `blenda4d/` and plugs in through `kinds.py`, so most items touch 
 - Displace from an image, a gentler smoothing mode, a wave that fades with distance, a Shrinkwrap offset.
 
 ## Volumes (`volume.py`)
-In: the **Volume Builder** (meshes, splines, text, points and other Volume Builders under it become one distance
-volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
-order, with Volume From (Auto, Filled, Surface, Points, Edges), Radius, Grow / Shrink and a Filter (Smooth, Clean,
+In: the **Volume Builder** (meshes, splines, text, points, particles, smoke, VDB volumes, metaballs, NURBS surfaces,
+Grease Pencil, collection instances and other Volume Builders under it become one distance volume; an Objects list, which also takes drops from the Object Manager, adds, subtracts or intersects each one in
+order, with Volume From (Auto, Filled, Surface, Points, Edges, Particles, Smoke / Density), Radius, Grow / Shrink and a Filter (Smooth, Clean,
 Relax, Round) per row; filter layers in the list (Smooth, Clean, Relax, Round, Fillet, Grow / Shrink) that change
 everything above them, each limited to where its fields reach (mixed Max, Normal, Min, Add, Subtract or Multiply);
 a soft Blend where each row meets the ones above; and Voxel Size, Grow / Shrink,
@@ -46,7 +46,8 @@ Shading; the surface takes the Mesher's material; Quad Remesh with Target Faces,
 Still to do:
 - Quads whose size follows the detail (Blender's QuadriFlow makes evenly sized quads), and Quad Remesh that updates
   by itself when the volume changes.
-- Particle systems as inputs (Blender's particles can't be read by geometry nodes; point clouds and meshes can).
+- Smoke from an Adaptive Domain (the smoke moves with the domain's moving box; today it needs Adaptive Domain off),
+  and liquids (FLIP) as inputs.
 - Fog noise that moves over time.
 
 ## Lights and sky (`lights.py`, `sky.py`)

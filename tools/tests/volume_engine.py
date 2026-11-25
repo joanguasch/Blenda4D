@@ -575,7 +575,102 @@ def test_quad_remesh():
     check(not vm.b4d_vq_on and len(vm.data.polygons) == 0 and back[1] > 0, "Back to Live shows the live surface again")
 
 
-for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_filter_layers_and_fields, test_soft_blend_and_field_mix, test_quad_remesh, test_switch_off):
+def test_other_blender_objects():
+    print("== particles, metaballs, NURBS surfaces, Grease Pencil, collection instances and VDB volumes")
+    clear()
+    sc = bpy.context.scene
+    sc.frame_set(1)
+    bpy.ops.mesh.primitive_plane_add(size=2.0)
+    em = bpy.context.object
+    em.name = "Emitter"
+    em.modifiers.new("Particles", "PARTICLE_SYSTEM")
+    st = em.particle_systems[0].settings
+    st.count, st.frame_start, st.frame_end, st.lifetime = 40, 1, 1, 100
+    st.normal_factor, st.effector_weights.gravity = 1.0, 0.0
+    vb = add("volume_builder", [em])
+    row = vb.b4d_vol_items[0]
+    check(V._input_shape(em, row) == "particles", "an emitter is read as its particles")
+    sc.frame_set(1)
+    sc.frame_set(20)
+    update()
+    feed = bpy.data.objects.get(f"Blenda Volume Feed [{em.name}]")
+    check(feed is not None and len(feed.data.vertices) == 40 and feed.name not in sc.objects,
+          f"its live particles are fed in as hidden points ({len(feed.data.vertices) if feed else None})")
+    b20 = bounds(vb)
+    check(b20 is not None and b20[1][2] > 0.5, f"a ball on every particle, where they are now ({b20})")
+    sc.frame_set(40)
+    b40 = bounds(vb)
+    check(b40[1][2] > b20[1][2] + 0.3, f"and they follow the particles as frames play ({b20[1][2]} -> {b40[1][2]})")
+    small = b40
+    row.radius = 30.0
+    vb.update_tag()
+    check(bounds(vb)[1][2] > small[1][2] + 0.1, "Radius makes the balls bigger")
+    check(em.hide_render, "the emitter (and its particles) don't render under the builder")
+    sc.frame_set(1)
+    # other object types
+    clear()
+    made = []
+    bpy.ops.object.metaball_add(type="BALL", location=(0, 0, 0))
+    made.append(bpy.context.object)
+    bpy.ops.surface.primitive_nurbs_surface_sphere_add(location=(3, 0, 0))
+    made.append(bpy.context.object)
+    col = bpy.data.collections.new("Parts")
+    bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+    part = bpy.context.object
+    for c in list(part.users_collection):
+        c.objects.unlink(part)
+    col.objects.link(part)
+    bpy.ops.object.empty_add(location=(0, 3, 0))
+    inst = bpy.context.object
+    inst.instance_type, inst.instance_collection = "COLLECTION", col
+    made.append(inst)
+    for ob in made:
+        check(V.usable(ob) and V._input_shape(ob) == "solid", f"{ob.type} is filled")
+    vb = add("volume_builder", made)
+    check(len(vb.b4d_vol_items) == 3, "all of them get a row")
+    b = bounds(vb)
+    check(b and b[1][0] > 3.5 and b[1][1] > 3.5, f"and all of them are in the volume ({b})")
+    bpy.ops.object.empty_add()
+    plain = bpy.context.object
+    check(not V.usable(plain), "a plain empty is not")
+    # Grease Pencil strokes become tubes
+    clear()
+    try:
+        bpy.ops.object.grease_pencil_add(type="STROKE")
+        gp = bpy.context.object
+        check(V._input_shape(gp) == "tube", "Grease Pencil strokes become tubes")
+        vb = add("volume_builder", [gp])
+        vb.b4d_vol_items[0].radius = 5.0
+        vb.update_tag()
+        check(bounds(vb) is not None, "the strokes make a volume")
+    except Exception as e:
+        check(False, f"Grease Pencil ({e})")
+    # a VDB-style volume object: its density, cut at Density
+    clear()
+    vol = bpy.data.objects.new("Cloud", bpy.data.volumes.new("Cloud"))
+    bpy.context.collection.objects.link(vol)
+    t = bpy.data.node_groups.new("Cloud Maker", "GeometryNodeTree")
+    t.is_modifier = True
+    t.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    cube_ = t.nodes.new("GeometryNodeMeshCube")
+    cube_.inputs["Size"].default_value = (1.2, 1.2, 1.2)
+    dens = t.nodes.new("GeometryNodeMeshToDensityGrid")
+    t.links.new(cube_.outputs["Mesh"], dens.inputs["Mesh"])
+    dens.inputs["Voxel Size"].default_value = 0.05
+    store = t.nodes.new("GeometryNodeStoreNamedGrid")
+    store.data_type = "FLOAT"
+    store.inputs["Name"].default_value = "density"
+    t.links.new(dens.outputs[0], store.inputs["Grid"])
+    out = t.nodes.new("NodeGroupOutput")
+    t.links.new(store.outputs[0], out.inputs[0])
+    vol.modifiers.new("Cloud", "NODES").node_group = t
+    check(V.usable(vol) and V._input_shape(vol) == "fog", "a volume object is read by its density")
+    vb = add("volume_builder", [vol])
+    b = bounds(vb)
+    check(b is not None and 1.0 < b[1][0] - b[0][0] < 1.5, f"its surface where the density passes Density ({b})")
+
+
+for t in (test_builder_and_mesher, test_splines_points_and_nesting, test_text_and_fog, test_volume_from_and_viewport, test_filter_layers_and_fields, test_soft_blend_and_field_mix, test_quad_remesh, test_other_blender_objects, test_switch_off):
     try:
         t()
     except Exception:

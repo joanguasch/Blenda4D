@@ -47,7 +47,7 @@ MODES = [("ADD", "Add", "Join this object to the volume above it", "ADD", 0),
          ("SUBTRACT", "Subtract", "Cut this object out of the volume above it", "REMOVE", 1),
          ("INTERSECT", "Intersect", "Keep only where this object and the volume above it overlap", "SELECT_INTERSECT", 2)]
 BOOLEAN = {"ADD": "UNION", "SUBTRACT": "DIFFERENCE", "INTERSECT": "INTERSECT"}
-INPUT_TYPES = ("MESH", "CURVE", "POINTCLOUD", "FONT")
+INPUT_TYPES = ("MESH", "CURVE", "POINTCLOUD", "FONT", "META", "SURFACE", "GREASEPENCIL", "VOLUME", "EMPTY")
 # the per-row filter: (key, label, tip, node, has Width)
 FILTERS = [("MEAN", "Smooth", "Average the shape out: softens everything", "GeometryNodeSDFGridMean", True),
            ("MEDIAN", "Clean", "Take off small bumps and specks, keep larger edges", "GeometryNodeSDFGridMedian", True),
@@ -91,8 +91,16 @@ def put(ob, name, v):
 
 
 def usable(ob):
-    """An object a Volume Builder can read: a mesh, a spline, a point cloud or another Volume Builder."""
-    return ob is not None and (kind(ob) == "volume_builder" or (ob.type in INPUT_TYPES and kind(ob) is None))
+    """An object a Volume Builder can read: a mesh (with its particles, or a smoke domain), a spline, text, a point
+    cloud, a metaball, a NURBS surface, Grease Pencil, a volume (VDB), an empty showing a collection, or another
+    Volume Builder."""
+    if ob is None or FEED in ob:
+        return False
+    if kind(ob) == "volume_builder":
+        return True
+    if ob.type == "EMPTY":
+        return ob.instance_type == "COLLECTION" and ob.instance_collection is not None and kind(ob) is None
+    return ob.type in INPUT_TYPES and kind(ob) is None
 
 
 def rows(builder):
@@ -117,18 +125,41 @@ LAYERS = {
 }
 
 
+def _emits(ob):
+    """True when a mesh has a particle system that emits (not hair)."""
+    return ob.type == "MESH" and any(ps.settings is not None and ps.settings.type == "EMITTER" for ps in ob.particle_systems)
+
+
+def _smoke_domain(ob):
+    """The smoke (gas) domain settings of a mesh, or None."""
+    for m in getattr(ob, "modifiers", []):
+        if m.type == "FLUID" and m.fluid_type == "DOMAIN" and m.domain_settings is not None and m.domain_settings.domain_type == "GAS":
+            return m.domain_settings
+    return None
+
+
 SOURCES = [
     ("AUTO", "Auto", "Pick from the object: closed meshes are filled, splines become tubes, flat text a shell, loose points balls"),
     ("FILLED", "Filled", "The whole inside of a closed mesh (needs a mesh without holes)"),
     ("SURFACE", "Surface", "A shell of Radius over the faces: for open, flat or single-sided shapes"),
     ("POINTS", "Points", "A ball of Radius on every point"),
     ("EDGES", "Edges", "A tube of Radius along every edge or spline"),
+    ("PARTICLES", "Particles", "A ball on every live particle of the object's particle systems (Radius times the particle's size)"),
+    ("DENSITY", "Smoke / Density", "The smoke of a smoke domain, or the density of a volume (VDB), where it is thicker than Density"),
 ]
-SHAPE = {"FILLED": "solid", "SURFACE": "text", "POINTS": "points", "EDGES": "tube"}
+SHAPE = {"FILLED": "solid", "SURFACE": "text", "POINTS": "points", "EDGES": "tube", "PARTICLES": "particles"}
 
 
 def _auto_shape(ob):
-    if ob.type == "CURVE":
+    if ob.type == "VOLUME":
+        return "fog"
+    if _smoke_domain(ob) is not None:
+        return "smoke"
+    if _emits(ob):
+        return "particles"
+    if ob.type in ("META", "SURFACE", "EMPTY"):
+        return "solid"
+    if ob.type in ("CURVE", "GREASEPENCIL"):
         return "tube"
     if ob.type == "FONT":                             # flat letters have no inside: they become a shell
         cu = ob.data
@@ -148,7 +179,11 @@ def _input_shape(ob, row=None):
     if kind(ob) == "volume_builder":
         return "builder"
     src = getattr(row, "source", "AUTO") if row is not None else "AUTO"
-    if src == "AUTO":
+    if src == "DENSITY":
+        return "fog" if ob.type == "VOLUME" else ("smoke" if _smoke_domain(ob) is not None else _auto_shape(ob))
+    if src == "PARTICLES" and not _emits(ob):
+        return _auto_shape(ob)
+    if src == "AUTO" or (ob.type == "VOLUME" and src != "DENSITY"):
         return _auto_shape(ob)
     if src == "FILLED" and ob.type == "CURVE":       # a spline has no inside of its own: fill it flat and shell it
         return "text"
@@ -221,12 +256,157 @@ def _new_tree(name, k, owner):
     return tree
 
 
+# --- particles and smoke: fed in as points ---------------------------------------------------------------------
+# Geometry nodes can't read particle systems or a smoke domain's smoke, but Python can: a hidden mesh of points
+# (not in the scene; the builder's nodes keep it) is kept up to date with them on every frame and change, each point
+# with its size in the "b4d_r" attribute.
+
+FED = ("particles", "smoke")
+FEED = "b4d_vol_feed"                                 # marks the hidden mesh, holding the name of the object it follows
+
+
+def _feed_object(src):
+    name = f"Blenda Volume Feed [{src.name}]"
+    ob = bpy.data.objects.get(name)
+    if ob is None or ob.type != "MESH":
+        ob = bpy.data.objects.new(name, bpy.data.meshes.new(name))
+        ob[FEED] = src.name
+    return ob
+
+
+def _particle_points(src, depsgraph):
+    import numpy as np
+    ev = src.evaluated_get(depsgraph)
+    cos, sizes = [], []
+    for ps in ev.particle_systems:
+        if ps.settings is None or ps.settings.type != "EMITTER":
+            continue
+        n = len(ps.particles)
+        if not n:
+            continue
+        co = np.empty(n * 3, dtype=np.float32)
+        ps.particles.foreach_get("location", co)
+        alive = np.empty(n, dtype=np.int32) if hasattr(ps.particles[0], "alive_state") else None
+        sz = np.empty(n, dtype=np.float32)
+        ps.particles.foreach_get("size", sz)
+        keep = np.ones(n, dtype=bool)
+        if alive is not None:
+            states = [p.alive_state for p in ps.particles]
+            keep = np.array([st == "ALIVE" for st in states], dtype=bool)
+        cos.append(co.reshape(-1, 3)[keep])
+        sizes.append(sz[keep])
+    if not cos:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.float32)
+    co, sz = np.concatenate(cos), np.concatenate(sizes)
+    mean = float(sz.mean()) if len(sz) else 1.0
+    return co, (sz / mean if mean > 0 else np.ones_like(sz))     # particles move in world space already
+
+
+def _smoke_points(src, row, depsgraph):
+    """A point on every smoke cell thicker than Density, in world space, each as big as a cell."""
+    import numpy as np
+    from mathutils import Matrix
+    ev = src.evaluated_get(depsgraph)
+    ds = next((m.domain_settings for m in ev.modifiers if m.type == "FLUID" and m.fluid_type == "DOMAIN"), None)
+    empty = np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.float32)
+    if ds is None:
+        return empty
+    dens = np.array(ds.density_grid[:], dtype=np.float32)
+    res = np.array(ds.domain_resolution[:], dtype=np.int64)
+    if not dens.size or res.prod() <= 0:
+        return empty
+    up = round((dens.size / res.prod()) ** (1.0 / 3.0))  # with noise the grid is finer by the noise scale
+    res = res * max(1, up)
+    if res.prod() != dens.size:
+        return empty
+    grid = dens.reshape(res[2], res[1], res[0])         # x changes fastest
+    z, y, x = np.nonzero(grid > row.density)
+    if not len(x):
+        return empty
+    lo = np.array([min(c[k] for c in src.bound_box) for k in range(3)], dtype=np.float32)
+    hi = np.array([max(c[k] for c in src.bound_box) for k in range(3)], dtype=np.float32)
+    cell = (hi - lo) / res.astype(np.float32)
+    local = lo + (np.stack([x, y, z], axis=1).astype(np.float32) + 0.5) * cell
+    mw = np.array(src.matrix_world, dtype=np.float32)
+    world = local @ mw[:3, :3].T + mw[:3, 3]
+    big = float(np.max(np.abs(np.array(Matrix(src.matrix_world).to_3x3().to_scale())) * cell)) * 0.9
+    return world, np.full(len(world), big, dtype=np.float32)
+
+
+def _feed(src, row, depsgraph):
+    """Bring the hidden points of one particle or smoke row up to date."""
+    shape = _input_shape(src, row)
+    if shape not in FED:
+        return
+    co, r = _particle_points(src, depsgraph) if shape == "particles" else _smoke_points(src, row, depsgraph)
+    ob = _feed_object(src)
+    me = ob.data
+    key = (len(co), float(co.sum()) if len(co) else 0.0, float(r.sum()) if len(r) else 0.0)
+    if tuple(ob.get("b4d_feed_key", ())) == key:
+        return
+    ob["b4d_feed_key"] = key
+    me.clear_geometry()
+    me.vertices.add(len(co))
+    if len(co):
+        me.vertices.foreach_set("co", co.astype("float32").ravel())
+    at = me.attributes.get("b4d_r") or me.attributes.new("b4d_r", "FLOAT", "POINT")
+    if len(r):
+        at.data.foreach_set("value", r.astype("float32"))
+    me.update()
+
+
+def feed_all(scene, depsgraph=None, only=None):
+    """Update the fed points of every Volume Builder's particle and smoke rows (only those following `only`)."""
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    for b in [o for o in scene.objects if kind(o) == "volume_builder"]:
+        for r in rows(b):
+            if only is None or r.obj.name in only:
+                try:
+                    _feed(r.obj, r, depsgraph)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+
+@bpy.app.handlers.persistent
+def _on_frame(scene, depsgraph=None):
+    feed_all(scene, depsgraph)
+
+
 def _row_grid(G, builder, i, row, voxel):
     """The distance grid of one row, with its Grow / Shrink and Smoothing."""
     ob = row.obj
     shape = _input_shape(ob, row)
-    geo = G.info(ob).outputs["Geometry"]
-    if shape == "builder":
+    geo = G.info(_feed_object(ob) if shape in FED else ob).outputs["Geometry"]
+    if shape in FED:                                  # particles or smoke, fed in as points with their own sizes
+        pts = G.node("GeometryNodeMeshToPoints")
+        G.l.new(geo, pts.inputs["Mesh"])
+        size = G.node("GeometryNodeInputNamedAttribute", data_type="FLOAT")
+        size.inputs["Name"].default_value = "b4d_r"
+        r = size.outputs["Attribute"]
+        if shape == "particles":                       # Radius times each particle's size (1 = the average size)
+            r = G.m("MULTIPLY", r, G.cm(G.driven(builder, f"b4d_vol_items[{i}].radius", row.radius)))
+        sdf = G.node("GeometryNodePointsToSDFGrid")
+        G.l.new(pts.outputs[0], sdf.inputs["Points"])
+        G.l.new(r, sdf.inputs["Radius"])
+        G.l.new(voxel, sdf.inputs["Voxel Size"])
+        if "Band Width" in sdf.inputs:
+            sdf.inputs["Band Width"].default_value = 3
+        grid = sdf.outputs[0]
+    elif shape == "fog":                              # a volume (VDB): its surface where it is thicker than Density
+        get = G.node("GeometryNodeGetNamedGrid", data_type="FLOAT")
+        G.l.new(geo, get.inputs["Volume"])
+        get.inputs["Name"].default_value = row.grid or "density"
+        surf = G.node("GeometryNodeGridToMesh")
+        G.l.new(get.outputs["Grid"], surf.inputs["Grid"])
+        G.l.new(G.driven(builder, f"b4d_vol_items[{i}].density", row.density), surf.inputs["Threshold"])
+        sdf = G.node("GeometryNodeMeshToSDFGrid")
+        G.l.new(surf.outputs["Mesh"], sdf.inputs["Mesh"])
+        G.l.new(voxel, sdf.inputs["Voxel Size"])
+        if "Band Width" in sdf.inputs:
+            sdf.inputs["Band Width"].default_value = 3
+        grid = sdf.outputs[0]
+    elif shape == "builder":
         get = G.node("GeometryNodeGetNamedGrid", data_type="FLOAT")
         G.l.new(geo, get.inputs["Volume"])
         get.inputs["Name"].default_value = GRID
@@ -242,9 +422,14 @@ def _row_grid(G, builder, i, row, voxel):
             G.l.new(radius, circle.inputs["Radius"])
             edges = G.node("GeometryNodeMeshToCurve")    # a mesh's edges become splines; splines pass through
             G.l.new(geo, edges.inputs["Mesh"])
+            strokes = G.node("GeometryNodeGreasePencilToCurves")   # Grease Pencil strokes become splines too
+            G.l.new(geo, strokes.inputs["Grease Pencil"])
+            flat = G.node("GeometryNodeRealizeInstances")       # the strokes come out as instances
+            G.l.new(strokes.outputs[0], flat.inputs["Geometry"])
             both = G.node("GeometryNodeJoinGeometry")
             G.l.new(geo, both.inputs[0])
             G.l.new(edges.outputs[0], both.inputs[0])
+            G.l.new(flat.outputs[0], both.inputs[0])
             tube = G.node("GeometryNodeCurveToMesh")
             G.l.new(both.outputs[0], tube.inputs["Curve"])
             G.l.new(circle.outputs["Curve"], tube.inputs["Profile Curve"])
@@ -783,6 +968,14 @@ def sync_all():
 @bpy.app.handlers.persistent
 def _on_update(scene, depsgraph=None):
     sync(scene)
+    if depsgraph is not None and not _busy[0]:
+        changed = {u.id.name for u in depsgraph.updates if isinstance(u.id, bpy.types.Object) and FEED not in u.id}
+        if changed:
+            _busy[0] = True
+            try:
+                feed_all(scene, depsgraph, only=changed)
+            finally:
+                _busy[0] = False
 
 
 # --- Render as Fog ---------------------------------------------------------------------------------------------
@@ -910,6 +1103,17 @@ def _row_changed(self, context):
     sync_all()
 
 
+def _density_changed(self, context):
+    ob = self.id_data
+    if isinstance(ob, bpy.types.Object):
+        if self.obj is not None:
+            try:
+                _feed(self.obj, self, context.evaluated_depsgraph_get())
+            except Exception:
+                pass
+        ob.update_tag()
+
+
 def _blend_changed(self, context):
     if isinstance(self.id_data, bpy.types.Object):
         self.id_data.update_tag()
@@ -947,6 +1151,10 @@ class BLENDA4D_PG_volume_item(bpy.types.PropertyGroup):
                                    description="What part of the object becomes volume")
     radius: bpy.props.FloatProperty(name="Radius", default=10.0, min=0.0, soft_max=1000.0, precision=1,
                                     description="How thick the tubes, balls or shell are (cm)")
+    density: bpy.props.FloatProperty(name="Density", default=0.1, min=0.0, soft_max=1.0, precision=3, update=_density_changed,
+                                     description="Smoke or volume thicker than this becomes volume")
+    grid: bpy.props.StringProperty(name="Grid", default="density", update=_row_changed,
+                                   description="Which grid of the volume (VDB) to read")
     blend: bpy.props.FloatProperty(name="Blend", default=0.0, min=0.0, soft_max=100.0, precision=1, update=_blend_changed,
                                    description="Melt this object into the rows above it over this distance (cm): 0 is a sharp edge")
     grow: bpy.props.FloatProperty(name="Grow / Shrink", default=0.0, soft_min=-100.0, soft_max=100.0, precision=1,
@@ -970,7 +1178,9 @@ class BLENDA4D_UL_volume_items(bpy.types.UIList):
             return
         ob = item.obj
         sub.label(text=ob.name if ob else "(gone)", icon=kinds.KINDS.get(kind(ob), {}).get("icon", "OBJECT_DATA")
-                  if kind(ob) else {"MESH": "MESH_DATA", "CURVE": "CURVE_DATA", "POINTCLOUD": "POINTCLOUD_DATA", "FONT": "FONT_DATA"}.get(
+                  if kind(ob) else {"MESH": "MESH_DATA", "CURVE": "CURVE_DATA", "POINTCLOUD": "POINTCLOUD_DATA", "FONT": "FONT_DATA",
+                   "META": "META_DATA", "SURFACE": "SURFACE_DATA", "GREASEPENCIL": "OUTLINER_DATA_GREASEPENCIL",
+                   "VOLUME": "VOLUME_DATA", "EMPTY": "OUTLINER_OB_GROUP_INSTANCE"}.get(
                       getattr(ob, "type", ""), "OBJECT_DATA"))
         sub.prop(item, "mode", text="", icon_only=True, emboss=False)
 
@@ -1173,8 +1383,19 @@ def page_builder(col, ob):
         if kind(row.obj) != "volume_builder":
             box.prop(row, "source")
         shape = _input_shape(row.obj, row)
-        if shape in ("tube", "points", "text"):
+        if shape in ("tube", "points", "text", "particles"):
             box.prop(row, "radius", text="Radius (cm)")
+        if shape in ("smoke", "fog"):
+            box.prop(row, "density", text="Density")
+        if shape == "fog":
+            box.prop(row, "grid")
+        if shape == "smoke":
+            ds = _smoke_domain(row.obj)
+            if ds is not None and ds.use_adaptive_domain:
+                box.label(text="Adaptive Domain moves the smoke: turn it off for the volume to follow", icon="ERROR")
+            box.label(text="Reads the smoke cache: bake it, or play the simulation", icon="INFO")
+        if shape == "particles":
+            box.label(text="Follows the live particles as the frames play", icon="INFO")
         if i > 0:
             box.prop(row, "blend", text="Blend (cm)")
         box.prop(row, "grow", text="Grow / Shrink (cm)")
@@ -1535,11 +1756,15 @@ def register():
         kinds.create_button("volume", LABELS[k], k)
     if _on_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_update)
+    if _on_frame not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_on_frame)
 
 
 def unregister():
     if _on_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_update)
+    if _on_frame in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_on_frame)
     from . import managers
     if drop in managers.OM_DROP:
         managers.OM_DROP.remove(drop)
